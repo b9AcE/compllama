@@ -1,0 +1,3052 @@
+#!/bin/bash
+#
+# compllama
+#
+# Version: 20261014T0940
+#
+# Compiles llama.cpp from source for ONE selected GPU backend, either
+# CUDA (nVidia) or Vulkan (any vendor). Backends are built separately
+# so that neither machine needs the other's toolchain installed.
+#
+# Installs to /opt/llamacpp-<backend>-YYYYMMDDTHHMM-<ref> with a /opt/llamacpp
+# symlink pointing at the build currently in use. Switching between
+# already-built backends is done with --activate, which repoints that
+# symlink rather than recompiling.
+#
+# Optionally installs a llama-server systemd service and the inillama
+# model-preset helper script if they are not already present.
+#
+# Usage: Run as a regular user who has sudo access.
+#        The script will invoke sudo only where needed.
+#        Run with -h or --help for usage information.
+#
+
+# ─── User-editable defaults ─────────────────────────────────────────
+# These are used as suggested defaults during interactive prompts,
+# or used directly when -d is specified.
+# Leave DEFAULT_SERVICE_USER empty to auto-detect (uses ${USER}).
+# Leave DEFAULT_SERVICE_HOST empty to auto-detect (first UP wired/wifi interface).
+# Leave DEFAULT_CUDA_ARCH empty to auto-detect via nvidia-smi.
+DEFAULT_SERVICE_USER=""
+DEFAULT_SERVICE_PORT="11435"
+DEFAULT_SERVICE_HOST=""
+DEFAULT_CUDA_ARCH=""
+
+# Local llama.cpp clone used for --offline builds. A relative path is
+# resolved against the current working directory, so the default finds
+# ./llamacpp-clone. Set an absolute path here to make --offline work
+# the same no matter which directory the script is run from.
+DEFAULT_OFFLINE_CLONE="llamacpp-clone"
+
+# Where the source is copied to and compiled. This is a scratch tree:
+# it is deleted and recreated on every run, and nothing is delivered
+# from it. It is kept after a build only so that a failed compile can
+# still be investigated. Relative paths resolve against the current
+# working directory, as above.
+DEFAULT_COMPILE_DIR="llama.cpp-compile"
+
+# ─── Fixed paths ────────────────────────────────────────────────────
+LLAMACPP_LINK="/opt/llamacpp"
+SERVICE_FILE="/etc/systemd/system/llama-server.service"
+INILLAMA_FILE="${HOME}/.local/bin/inillama"
+# Relative to the service user's home directory. Created and extended
+# by inillama, never by compllama itself.
+PRESET_FILE_REL=".config/llama.cpp/inillama.ini"
+LDCONF_FILE="/etc/ld.so.conf.d/llamacpp.conf"
+PROFILE_FILE="/etc/profile.d/llamacpp.sh"
+PERSISTENT_CONF="/etc/localllama.conf"
+# Written into the files compllama creates whole (the systemd unit and
+# inillama), so that --uninstall removes only files it made itself.
+# The same text appears literally inside inillama's quoted heredoc;
+# keep the two identical.
+COMPLLAMA_MARK="# Created by compllama; removed by compllama --uninstall."
+BLOC_BEGIN="# ── BEGIN bloc managed by local llama.cpp compile-script ──"
+BLOC_END="# ── END bloc managed by local llama.cpp compile-script ──"
+
+# ─── Colour helpers (ANSI) ───────────────────────────────────────────
+c_red=$'\e[31m'
+c_yellow=$'\e[33m'
+c_green=$'\e[32m'
+c_cyan=$'\e[36m'
+c_bold=$'\e[1m'
+c_note=$'\e[1;97m'
+c_reset=$'\e[0m'
+
+msg_info()  { printf '%s%b%s\n' "${c_cyan}"   "$*" "${c_reset}"; }
+msg_ok()    { printf '%s%b%s\n' "${c_green}"   "$*" "${c_reset}"; }
+msg_warn()  { printf '%s%b%s\n' "${c_yellow}"  "$*" "${c_reset}"; }
+msg_error() { printf '%s%b%s\n' "${c_red}"     "$*" "${c_reset}" >&2; }
+msg_fatal() { msg_error "$*"; exit 1; }
+# For information the user may want to act on: a bold bright white
+# "NOTE:" ahead of an otherwise ordinary info line.
+msg_note()  { printf '%sNOTE:%s %s%b%s\n' "${c_note}" "${c_reset}" "${c_cyan}" "$*" "${c_reset}"; }
+
+# ─── Help ────────────────────────────────────────────────────────────
+show_help() {
+	cat <<'EOF'
+Usage: compllama [OPTIONS]
+
+Compiles llama.cpp from source for one selected GPU backend and installs
+it to /opt/llamacpp-<backend>-YYYYMMDDTHHMM-<ref>, with /opt/llamacpp symlinked
+to the build in use. Optionally installs a llama-server systemd service
+and the inillama model-preset helper script.
+
+Options:
+  -b, --backend <name>   GPU backend to build: cuda or vulkan.
+                         When omitted, the backend is auto-detected:
+                         an nVidia GPU anywhere in the system selects
+                         cuda, otherwise an AMD GPU selects vulkan.
+                         Backends not selected are explicitly disabled
+                         so that an unrelated toolkit present on the
+                         system cannot be picked up by accident.
+
+  -g, --gpu <N|list>     Pin llama-server to one specific GPU.
+                         "--gpu list" prints the candidate GPUs for the
+                         selected backend, numbered from 1, and exits.
+                         "--gpu N" then picks entry N without asking.
+                         The numbers come from vulkaninfo (Vulkan, with
+                         software renderers such as llvmpipe left out)
+                         or nvidia-smi (CUDA), not from llama-server,
+                         so they are available before anything is
+                         built.
+                         When omitted on a Vulkan build, a single
+                         discrete GPU, or failing that a single GPU of
+                         any kind, is chosen without asking. Otherwise
+                         the same numbered list is shown and you pick
+                         one, before the build starts, or the run
+                         fails under -d/-y so that it never waits for
+                         an answer nobody is there to give.
+                         A Vulkan choice is recorded by device name and
+                         resolved after the build by asking the new
+                         binary, so two GPUs with identical names
+                         cannot be told apart. A CUDA choice is
+                         recorded by the GPU's UUID.
+                         CUDA builds are left unrestricted unless this
+                         option is given, as CUDA never enumerates an
+                         integrated GPU.
+
+  -a, --activate <name>  Switch to an already-built backend without
+                         recompiling: stops llama-server, repoints
+                         /opt/llamacpp at the most recent build of the
+                         named backend, runs ldconfig, starts the
+                         service again, then exits. All other options
+                         are ignored. To activate a build older than
+                         the most recent one of that backend, repoint
+                         the symlink by hand.
+
+  -o, --offline          Build from a local clone instead of cloning
+                         from the network, so the whole run needs no
+                         connectivity at all. Requires that clone to
+                         already exist; it will not fall back to
+                         anything else.
+                         Bare -o uses the configured default location.
+                         --offline=PATH uses PATH instead, absolute or
+                         relative to the current directory. The value
+                         must be attached with "=", since -o on its own
+                         takes none.
+
+  -c, --compile-directory <path>
+                         Where the source is copied to and compiled.
+                         This is scratch space, not an output location:
+                         it is DELETED and recreated on every run, and
+                         nothing is delivered from it. It is kept after
+                         a build only so a failed compile can still be
+                         inspected. Before removing anything the script
+                         checks the directory really is a llama.cpp
+                         source tree, and refuses otherwise even under
+                         --yes.
+
+  -d, --defaults         Use configured defaults for all prompts without
+                         asking. Combines with --offline.
+
+  -r, --release <ver>    Compile a specific release instead of the latest
+                         nightly build tag. Use --release latest to build
+                         from git HEAD instead of a tag.
+                         A bare number is resolved by shape: one with a
+                         dot is a release and gets "v" (0.4.1 becomes
+                         v0.4.1), one without is a build and gets "b"
+                         (11067 becomes b11067). Anything else is used
+                         literally, so b11067, v0.4.1 and custom tags all
+                         work as written.
+                         Default: latest bNNNN build tag.
+
+  -y, --yes              Auto-accept removal of existing source directories
+                         without asking.
+
+      --no-prereq-check  Skip the prerequisite checks entirely. Those
+                         checks look for commands on PATH and for
+                         development libraries through pkg-config, so
+                         they are distribution-agnostic, but any such
+                         test can be wrong somewhere. This is the way
+                         past one without editing the script. Whatever
+                         is genuinely missing then surfaces later, as a
+                         cmake error or as a failure to run vulkaninfo.
+
+      --no-conf-template Do not create /etc/localllama.conf if it is
+                         absent. Only useful where /etc is not writable,
+                         or where you positively do not want the file.
+                         An existing file is never touched either way.
+
+  -t, --tools            Install or update the helper tools only, then
+                         exit, building nothing and needing no sudo.
+                         Currently that is inillama. Tools are only put
+                         in place, not run. A tool already present is
+                         replaced if it carries compllama's mark, and
+                         left alone otherwise. All other options are
+                         ignored.
+
+  -u, --uninstall        Uninstall system integration only: stops and
+                         removes the llama-server systemd service, removes
+                         managed blocs from /etc/ld.so.conf.d/llamacpp.conf
+                         and /etc/profile.d/llamacpp.sh (deleting those
+                         files if no other content remains), and removes
+                         the inillama script. Does NOT remove compiled
+                         binaries in /opt, and never touches
+                         /etc/localllama.conf or inillama's preset file.
+                         All other flags are ignored.
+
+  -l, --list-tags        List the most recent tags and exit, building
+                         nothing. The source follows --offline exactly:
+                         on its own it queries GitHub's releases API,
+                         and with --offline it reads the local clone.
+                         Neither falls back to the other, so you always
+                         get the source you asked for. Ordered newest
+                         first by date in both cases, and no tags are
+                         filtered out, so build tags and release tags
+                         appear interleaved by recency.
+
+  -h, --help             Show this help message and exit.
+
+Install directories:
+  Builds install to /opt/llamacpp-<backend>-<timestamp>-<ref>, where
+  <ref> comes from git describe, so a default build gives something like
+  llamacpp-vulkan-20260921T1200-b11067 and a build from HEAD past a tag
+  gives llamacpp-vulkan-20260921T1200-b11065-3-gce8caa6e6.
+  /opt/llamacpp symlinks to whichever build is in use.
+
+Working directories:
+  Both default to relative paths, so they land beside wherever you run
+  the script from. Set DEFAULT_OFFLINE_CLONE and DEFAULT_COMPILE_DIR
+  near the top of the script to absolute paths if you would rather they
+  stayed put regardless of the current directory.
+    llamacpp-clone       the clone --offline reads from; never written
+                         to or deleted by this script
+    llama.cpp-compile    scratch build tree; deleted and recreated on
+                         every run
+
+Configuration files:
+  /opt/llamacpp/llamacpp.conf   Generated per build. Holds the backend's
+                                own environment, such as the pinned GPU.
+                                Regenerated on every build, so it is not
+                                a place for settings you want to keep.
+  /etc/localllama.conf          Yours. Created once as a comments-only
+                                template if absent, then never modified
+                                or removed by this script. Read after the
+                                generated file by both the systemd unit
+                                and the profile.d script, so its values
+                                win. Use it for anything persistent.
+                                To opt out, empty it rather than deleting
+                                it, or pass --no-conf-template.
+EOF
+	exit 0
+}
+
+# ─── Path and source helpers ─────────────────────────────────────────
+# Relative paths resolve against the current working directory, and
+# everything is reported absolute so that an error always names the
+# real directory rather than echoing back what was typed.
+resolve_path() {
+	case "$1" in
+		/*) printf '%s' "$1" ;;
+		*)  printf '%s/%s' "${PWD}" "$1" ;;
+	esac
+}
+
+# Identity check for a llama.cpp source tree. include/llama.h is the
+# project's main public header, present in include/ across a far wider
+# range of tags than include/llama-cpp.h, which is absent before about
+# b4100-b4200. An installed development package can also provide
+# include/llama.h, for example under /usr, but never a top-level
+# CMakeLists.txt beside it, so requiring both identifies a source tree
+# rather than an install. Deliberately does NOT test for .git, since a
+# perfectly good copy may have had it stripped.
+#
+# This guards the one destructive operation in the script, so that a
+# mistyped --compile-directory cannot cause an rm -rf of something that
+# is not a build tree.
+is_llamacpp_source() {
+	[ -f "$1/CMakeLists.txt" ] && [ -f "$1/include/llama.h" ]
+}
+
+# How many tags --list-tags shows.
+LIST_TAGS_COUNT=20
+
+# Pointer used by error messages. The listing itself is a separate
+# job, reachable on purpose rather than only by provoking an error.
+tag_hint() {
+	printf 'Run with --list-tags to see the most recent tags, or --list-tags --offline to list those in a local clone.'
+}
+
+# Reject a value that looks like another option. No legitimate value
+# for any option here begins with a hyphen, so catching it turns
+# "--release -o" from a confusing lookup failure for a tag named "-o"
+# into an immediate and accurate complaint. Covers the short forms
+# too, which take space-separated values and would otherwise swallow
+# the next option in exactly the same way.
+reject_option_like_value() {
+	case "$2" in
+		-*) msg_fatal "${1} was given '${2}', which looks like another option rather than a value.\nIf you meant it literally, there is no way to pass it; no option here takes a value starting with a hyphen." ;;
+	esac
+}
+
+# ─── Logged execution helpers ────────────────────────────────────────
+# run_logged: Run a command with stdout/stderr captured to a log file.
+#   On failure, tell the user where the log is and exit.
+#   Usage: run_logged <logfile> <fail_message> <command...>
+run_logged() {
+	local logfile="$1" fail_msg="$2"
+	shift 2
+	if ! "$@" > "${logfile}" 2>&1; then
+		msg_fatal "${fail_msg} See: ${logfile}"
+	fi
+}
+
+# run_logged_dots: Same as run_logged but prints a "." every 5 seconds
+#   during execution to indicate the process is still alive.
+#   Usage: run_logged_dots <logfile> <fail_message> <command...>
+#
+# Two guards keep the dots from outliving the script, which they
+# previously did: interrupting a compile left the subshell reparented
+# under systemd, printing dots into the terminal forever.
+#   - the loop tests that its parent still exists, so an orphan stops
+#     by itself within one sleep interval no matter how it was orphaned
+#   - the PID is global rather than local, so the exit trap can kill it
+#     at once instead of waiting for that interval
+run_logged_dots() {
+	local logfile="$1" fail_msg="$2"
+	shift 2
+	( while kill -0 $$ 2>/dev/null; do printf '.'; sleep 5; done ) &
+	DOTS_PID=$!
+	"$@" > "${logfile}" 2>&1
+	local result=$?
+	kill "${DOTS_PID}" 2>/dev/null
+	wait "${DOTS_PID}" 2>/dev/null
+	DOTS_PID=""
+	printf '\n'
+	if [ ${result} -ne 0 ]; then
+		msg_fatal "${fail_msg} See: ${logfile}"
+	fi
+}
+
+# ─── GPU vendor detection ────────────────────────────────────────────
+# Reads PCI class and vendor IDs straight from sysfs so that no extra
+# package (lspci, vulkan-tools, rocminfo) is needed. Display-class
+# devices are 0x03xxxx; vendor 0x10de is nVidia, 0x1002 is AMD.
+# An nVidia GPU is assumed to be a discrete card intended for compute,
+# so it wins over any AMD integrated graphics also present.
+detect_gpu_vendor() {
+	local dev class vendor found_amd=false
+	for dev in /sys/bus/pci/devices/*; do
+		[ -r "${dev}/class" ] || continue
+		[ -r "${dev}/vendor" ] || continue
+		class=$(cat "${dev}/class")
+		case "${class}" in
+			0x03*) ;;
+			*) continue ;;
+		esac
+		vendor=$(cat "${dev}/vendor")
+		case "${vendor}" in
+			0x10de) printf 'nvidia'; return 0 ;;
+			0x1002) found_amd=true ;;
+		esac
+	done
+	if [ "${found_amd}" = true ]; then
+		printf 'amd'
+		return 0
+	fi
+	return 1
+}
+
+# ─── Was a file created by compllama? ────────────────────────────────
+# True only if the file carries COMPLLAMA_MARK. Anything else is taken
+# to be the user's own and is never removed. Uses sudo, so requires
+# sudo already acquired.
+created_by_compllama() {
+	sudo grep -qxF -- "${COMPLLAMA_MARK}" "$1" 2>/dev/null
+}
+
+# ─── Is the service running? ────────────────────────────────────────
+service_is_active() {
+	systemctl is-active --quiet llama-server.service 2>/dev/null
+}
+
+# ─── Confirm the service stayed up ──────────────────────────────────
+# With Type=simple, systemctl start succeeds as soon as the process is
+# forked, so a unit that crashes at once still reports success. A short
+# wait and a second look tell the two apart: a crashing unit is by then
+# failed or waiting to restart, neither of which counts as active.
+#
+# The most common reason is that the address in the unit's --host is not
+# on this machine at the moment, for instance with the network down.
+# llama-server then cannot bind and exits, and systemd retries every
+# RestartSec, so the service comes up by itself once the address
+# returns. That case is recognised and explained, since it needs no
+# action; any other failure points at the journal.
+confirm_service_running() {
+	local host
+	sleep 3
+	if service_is_active; then
+		msg_ok "llama-server.service is running."
+		return 0
+	fi
+	host=$(sed -n 's/.*--host[[:space:]]\{1,\}\([^[:space:]\\]\{1,\}\).*/\1/p' "${SERVICE_FILE}" 2>/dev/null | head -1)
+	case "${host}" in
+		""|0.0.0.0|::|localhost|127.*) ;;
+		*)
+			if command -v ip >/dev/null 2>&1 \
+				&& ! ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qxF -- "${host}"; then
+				msg_warn "llama-server.service is not running: the address ${host} it binds to is not on this machine right now (network down?)."
+				msg_note "systemd retries every 5 s, so the service will start by itself once ${host} is back."
+				return 0
+			fi
+			;;
+	esac
+	msg_warn "llama-server.service did not stay running. Check with: journalctl -u llama-server.service -e"
+}
+
+# ─── Make sure the service has model presets ─────────────────────────
+# Returns 1 if the service must not be started. A missing preset file
+# makes llama-server exit at once, so starting it would only begin a
+# restart loop; it is left stopped and the way out is shown instead.
+# A file naming no models is different: llama-server runs happily with
+# an empty list, and can be told about models added later with
+# inillama --reload, without a restart. So that case starts normally,
+# with a warning. The values are read back from the unit file itself,
+# since an existing unit is never rewritten and may name another user
+# or file than this run would have chosen. Creating and filling the
+# file is inillama's job, never this script's. Requires sudo already
+# acquired.
+ensure_service_presets() {
+	local unit_user preset
+	[ -f "${SERVICE_FILE}" ] || return 0
+	unit_user=$(sed -n 's/^User=//p' "${SERVICE_FILE}" | head -1)
+	preset=$(sed -n 's/.*--models-preset[[:space:]]\{1,\}\([^[:space:]\\]\{1,\}\).*/\1/p' "${SERVICE_FILE}" | head -1)
+	if [ -z "${unit_user}" ] || [ -z "${preset}" ]; then
+		return 0
+	fi
+	if ! sudo -u "${unit_user}" test -f "${preset}"; then
+		msg_warn "The service's preset file ${preset} does not exist. llama-server would exit at once, so it is not started."
+		msg_note "Create the file by running, as ${unit_user}:  inillama"
+		msg_note "Then start the service with:  sudo systemctl start llama-server.service"
+		return 1
+	fi
+	if ! sudo -u "${unit_user}" grep -qE '^[[:space:]]*(model|m|LLAMA_ARG_MODEL)[[:space:]]*=' "${preset}" 2>/dev/null; then
+		msg_warn "${preset} names no models yet, so llama-server will run but have nothing to serve."
+		msg_note "Add models by running, as ${unit_user}:  inillama --source=<folder with .gguf files> --reload"
+	fi
+	return 0
+}
+
+# ─── Write inillama, and optionally run it ──────────────────────────
+# Used by a build when inillama is absent, and by --tools to install or
+# update it. Only a build runs it afterwards ("run" as argument 1), since
+# the service it is about to start needs the preset file to exist;
+# --tools only puts the program in place, as installing anything should. An existing file is replaced only if it carries
+# COMPLLAMA_MARK, so a hand-made inillama is never overwritten. The
+# write goes through a temporary file, so an interrupted write cannot
+# leave a half-written script behind.
+install_inillama() {
+	local tmp run_after="${1:-}"
+	if [ -f "${INILLAMA_FILE}" ] && ! grep -qxF -- "${COMPLLAMA_MARK}" "${INILLAMA_FILE}" 2>/dev/null; then
+		msg_warn "${INILLAMA_FILE} does not look like one compllama created, so it was left in place."
+		return 0
+	fi
+	if [ -f "${INILLAMA_FILE}" ]; then
+		msg_info "Updating inillama at ${INILLAMA_FILE}..."
+	else
+		msg_info "Installing inillama to ${INILLAMA_FILE}..."
+	fi
+	if ! mkdir -p "$(dirname "${INILLAMA_FILE}")"; then
+		msg_fatal "Failed to create $(dirname "${INILLAMA_FILE}")."
+	fi
+	tmp=$(mktemp "${INILLAMA_FILE}.XXXXXX") || msg_fatal "Failed to create a temporary file beside ${INILLAMA_FILE}."
+
+	if ! cat > "${tmp}" <<'INILLAMA_SCRIPT'
+#!/bin/bash
+# Created by compllama; removed by compllama --uninstall.
+#
+# inillama: keeps llama-server's model-preset file up to date.
+#
+# Scans the folders named in the preset file (and any given with -s)
+# for .gguf models and appends a section for each model the file does
+# not mention yet. It only ever appends: sections already in the file,
+# including ones you have renamed or tuned, are never changed or
+# removed. Installed by the compllama script.
+
+ini_file="${HOME}/.config/llama.cpp/inillama.ini"
+source_prefix="; inillama-source = "
+unit_file="/etc/systemd/system/llama-server.service"
+
+usage() {
+	cat <<USAGE
+Usage: $(basename "$0") [OPTIONS]
+       $(basename "$0") run NAME|NUMBER [llama-cli options...]
+       $(basename "$0") ls|list
+
+Adds a section to ${ini_file}
+for every .gguf model found in its source folders that the file does
+not already mention. Existing sections are never changed or removed.
+
+Source folders are lines in that file that begin,
+in the absolute first column,
+with exactly "${source_prefix}" minus quote characters,
+followed immediately by the folder, for example:
+${source_prefix}~/.lmstudio/models
+In those lines and in -s, a leading ~/ and \$NAME or \${NAME} are
+replaced by the environment variable's value. Avoid a literal \$ in
+folder names.
+
+Options:
+  -s, --source <folder>  Also scan this folder, for this run only.
+                         May be given several times.
+  -n, --dry-run          Show what would be added, change nothing.
+  -p, --prune            Before scanning, remove every section whose
+                         model = file no longer exists (or is a broken
+                         symlink). The file as it was is kept as
+                         inillama.ini-before_prune beside it. Sections
+                         without a model = line, such as [*], are never
+                         removed.
+  -r, --reload           Afterwards, tell the running llama-server to
+                         re-read the file. This unloads a loaded model
+                         whose section was edited since it was loaded.
+  -h, --help             Show this help and exit.
+
+Section names follow llama.cpp's publisher/repo:QUANT form, with
+the part after the colon normalised exactly as llama-server does
+(UD-Q4_K_XL is listed as Q4_K_XL), where the folder layout allows
+it (LM Studio's does). Rename them freely: models are recognised by
+their model = path, not by the section name. A name without a colon
+is used exactly as written.
+
+ls, list
+  Lists every section that has a model = line, numbered, in file order
+  and named exactly as written. [MISSING] marks a section whose model
+  file does not exist.
+
+run NAME|NUMBER [llama-cli options...]
+  Starts llama-cli with the settings of section NAME, given as written
+  or in llama-server's form, or of the section at NUMBER in the ls
+  list: first [*], then that section, then the options given after it,
+  unchanged. Keys llama-cli does not know, such as server-only ones,
+  are skipped with a note. A NUMBER always means a position in the
+  list, so a section named only with digits is run by its number.
+  "run" and "ls" must be the first argument.
+
+Names starting with "-" or containing control characters (tabs
+included) are not listed, run or created; llama-server itself still
+accepts them. Every run also checks the file against llama-server's
+format and warns about any line that would make it refuse the file.
+USAGE
+}
+
+die() { echo "$(basename "$0"): $*" >&2; exit 1; }
+
+# ─── Arguments ──────────────────────────────────────────────────────
+# "run" is a separate mode: everything after its NAME belongs to
+# llama-cli, so it is taken before the option loop sees anything.
+run_mode=false
+list_mode=false
+run_name=""
+run_args=()
+if [ "${1:-}" = "ls" ] || [ "${1:-}" = "list" ]; then
+	list_mode=true
+	shift
+	[ $# -eq 0 ] || die "ls takes no arguments."
+fi
+if [ "${1:-}" = "run" ]; then
+	run_mode=true
+	shift
+	[ $# -gt 0 ] || die "run requires a section name (try --help)."
+	run_name="$1"
+	shift
+	run_args=("$@")
+	set --
+fi
+extra_sources=()
+dry_run=false
+do_reload=false
+do_prune=false
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-s|--source)
+			shift
+			[ $# -gt 0 ] || die "--source requires a folder."
+			case "$1" in -*) die "--source was given '$1', which looks like another option." ;; esac
+			extra_sources+=("$1")
+			;;
+		--source=*)
+			[ -n "${1#--source=}" ] || die "--source= was given an empty folder."
+			extra_sources+=("${1#--source=}")
+			;;
+		-n|--dry-run) dry_run=true ;;
+		-r|--reload) do_reload=true ;;
+		-p|--prune) do_prune=true ;;
+		-h|--help) usage; exit 0 ;;
+		*) die "Unknown argument: $1 (try --help)" ;;
+	esac
+	shift
+done
+
+# ─── Path helpers ───────────────────────────────────────────────────
+# Replaces a leading ~/ and every $NAME or ${NAME} with the variable's
+# value. Plain substitution only, never eval, so a folder line can not
+# run anything. An unset variable is an error rather than an empty
+# string, since "$LLMDIR/models" silently becoming "/models" would scan
+# the wrong place.
+expand_path() {
+	local in="$1" out="" name
+	case "${in}" in
+		\~) in="${HOME}" ;;
+		\~/*) in="${HOME}/${in#\~/}" ;;
+	esac
+	while [ -n "${in}" ]; do
+		if [[ "${in}" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*)\}(.*)$ ]] \
+			|| [[ "${in}" =~ ^\$([A-Za-z_][A-Za-z0-9_]*)(.*)$ ]]; then
+			name="${BASH_REMATCH[1]}"
+			in="${BASH_REMATCH[2]}"
+			if [ -z "${!name+set}" ]; then
+				echo "variable \$${name} is not set" >&2
+				return 1
+			fi
+			out+="${!name}"
+		else
+			out+="${in:0:1}"
+			in="${in:1}"
+		fi
+	done
+	printf '%s' "${out}"
+}
+
+trim() {
+	local s="$1"
+	s="${s#"${s%%[![:space:]]*}"}"
+	s="${s%"${s##*[![:space:]]}"}"
+	printf '%s' "${s}"
+}
+
+# ─── The file as llama-server reads it ──────────────────────────────
+# These follow the INI grammar in llama.cpp's common/preset.cpp, so
+# that inillama sees exactly the sections and values the router will:
+#   - a [header] starts in the first column; spaces and tabs after "["
+#     are dropped, the name is everything else up to "]" (so it can
+#     not contain "]", and trailing spaces are part of it), and only
+#     spaces, tabs and a comment may follow the "]";
+#   - a key = value line starts in the first column, with a key of
+#     letters, digits, "_", "." and "-", beginning with a letter or "_";
+#   - a value ends at the first ";" or "#", which start a comment, and
+#     loses surrounding spaces and tabs, so it can contain neither;
+#   - only blank and comment lines may be indented.
+# A single line that fits none of these makes llama-server refuse the
+# whole file.
+TAB=$'\t'
+ini_header_re="^\\[[ ${TAB}]*([^] ${TAB}][^]]*)\\][ ${TAB}]*([;#].*)?$"
+ini_kv_re="^([A-Za-z_][A-Za-z0-9_.-]*)[ ${TAB}]*=(.*)$"
+
+# The value of a key = value line, from the text after "=".
+ini_value() {
+	local v="$1"
+	v="${v%%[;#]*}"
+	v="${v#"${v%%[![:blank:]]*}"}"
+	v="${v%"${v##*[![:blank:]]}"}"
+	printf '%s' "${v}"
+}
+
+# Section names inillama will not list, run or create: a leading "-"
+# would read as an option on a command line, and control characters,
+# tabs included, are invisible or could act on the terminal when
+# printed. Everything else llama-server accepts is accepted here too.
+name_ok() {
+	case "$1" in
+		-*) return 1 ;;
+	esac
+	[[ "$1" =~ [[:cntrl:]] ]] && return 1
+	return 0
+}
+
+# Warns, on stderr, about every line llama-server could not parse.
+check_ini() {
+	local line n=0 shown
+	while IFS= read -r line || [ -n "${line}" ]; do
+		n=$((n + 1))
+		line="${line%$'\r'}"
+		[[ "${line}" =~ ^[[:blank:]]*$ ]] && continue
+		[[ "${line}" =~ ^[[:blank:]]*[\;#] ]] && continue
+		[[ "${line}" =~ ${ini_header_re} ]] && continue
+		[[ "${line}" =~ ${ini_kv_re} ]] && continue
+		shown=$(printf '%s' "${line}" | cat -vT)
+		echo "Line ${n} of ${ini_file}: llama-server cannot parse this line, so it will refuse the whole file:" >&2
+		echo "  ${shown}" >&2
+	done < "${ini_file}"
+}
+
+# ─── llama-server's form of a section name ──────────────────────────
+# Mirrors canonical_tag() in llama.cpp's common/preset.cpp: in a name
+# with a colon, the part after the last colon becomes whatever follows
+# its last "-" or "." (if that consists of letters, digits and
+# underscores only), in capitals; otherwise the whole part in capitals.
+# A name without a colon is left as it is. Following this exactly
+# keeps the names in the file identical to the ones the router lists.
+router_name() {
+	local name="$1" base tag
+	case "${name}" in
+		*:*) ;;
+		*) printf '%s' "${name}"; return ;;
+	esac
+	base="${name%:*}"
+	tag="${name##*:}"
+	if [[ "${tag}" =~ [-.]([A-Za-z0-9_]+)$ ]]; then
+		tag="${BASH_REMATCH[1]}"
+	fi
+	printf '%s:%s' "${base}" "${tag^^}"
+}
+
+# ─── Run mode ───────────────────────────────────────────────────────
+# Which llama-cli options exist is asked of llama-cli itself, through
+# its --help, so the check follows whatever build is active. Option
+# names are recognised by the GNU convention: one dash and a letter or
+# digit, or two dashes and a name beginning with one. Only lines that
+# start with such a name in the first column are read, and on each
+# line the names are read up to the first token that is not one, so
+# placeholders and descriptions are ignored, as are the ----- group
+# headings and a bare "--". An option takes a value if a single space
+# and a placeholder follow its last name; a wider gap means a flag.
+# ─── Runnable sections ──────────────────────────────────────────────
+# Fills runnable_name and runnable_model, in file order, with every
+# section that has a model = line. This order is what ls numbers and
+# what a NUMBER after run refers to.
+read_runnable() {
+	local line section="" value idx
+	runnable_name=()
+	runnable_model=()
+	local -A seen=()
+	while IFS= read -r line || [ -n "${line}" ]; do
+		line="${line%$'\r'}"
+		if [[ "${line}" =~ ${ini_header_re} ]]; then
+			section="${BASH_REMATCH[1]}"
+			if [ "${section}" != "*" ] && ! name_ok "${section}"; then
+				printf 'Ignoring [%s]: a name starting with "-" or containing control characters is not accepted.\n' \
+					"$(printf '%s' "${section}" | cat -vT)" >&2
+				section=""
+			fi
+			continue
+		fi
+		[ -n "${section}" ] && [ "${section}" != "*" ] || continue
+		[[ "${line}" =~ ${ini_kv_re} ]] || continue
+		case "${BASH_REMATCH[1]}" in
+			model|m|LLAMA_ARG_MODEL) ;;
+			*) continue ;;
+		esac
+		value=$(ini_value "${BASH_REMATCH[2]}")
+		[ -n "${value}" ] || continue
+		if [ -n "${seen[${section}]+x}" ]; then
+			idx="${seen[${section}]}"
+			runnable_model[idx]="${value}"
+		else
+			seen["${section}"]=${#runnable_name[@]}
+			runnable_name+=("${section}")
+			runnable_model+=("${value}")
+		fi
+	done < "${ini_file}"
+}
+
+# ─── List mode ──────────────────────────────────────────────────────
+if [ "${list_mode}" = true ]; then
+	[ -f "${ini_file}" ] || die "No ${ini_file}; run inillama once to create it."
+	check_ini
+	read_runnable
+	if [ "${#runnable_name[@]}" -eq 0 ]; then
+		echo "No models in ${ini_file}."
+		exit 0
+	fi
+	if [ -t 1 ]; then
+		missing_mark=$'\e[33m[MISSING]\e[0m '
+	else
+		missing_mark="[MISSING] "
+	fi
+	width=${#runnable_name[@]}
+	width=${#width}
+	for ((i = 0; i < ${#runnable_name[@]}; i++)); do
+		mark=""
+		[ -e "${runnable_model[i]}" ] || mark="${missing_mark}"
+		printf '%-*s %s%s\n' "${width}" "$((i + 1))" "${mark}" "${runnable_name[i]}"
+	done
+	exit 0
+fi
+
+if [ "${run_mode}" = true ]; then
+	[ -f "${ini_file}" ] || die "No ${ini_file}; run inillama once to create it."
+	case "${run_name}" in
+		-*) die "'${run_name}' looks like an option; run needs a model name or number first." ;;
+	esac
+	name_ok "${run_name}" || die "A model name with control characters is not accepted."
+	check_ini
+	# A number is always a position in the ls list, never a name.
+	exact_only=false
+	if [[ "${run_name}" =~ ^[0-9]+$ ]]; then
+		read_runnable
+		n=$((10#${run_name}))
+		if [ "${n}" -lt 1 ] || [ "${n}" -gt "${#runnable_name[@]}" ]; then
+			die "There is no model number ${run_name}; inillama ls lists ${#runnable_name[@]}."
+		fi
+		run_name="${runnable_name[n - 1]}"
+		exact_only=true
+		echo "Model ${n}: ${run_name}" >&2
+	fi
+	if [ -x /opt/llamacpp/bin/llama-cli ]; then
+		cli=/opt/llamacpp/bin/llama-cli
+	else
+		cli=$(command -v llama-cli) || die "llama-cli not found."
+	fi
+
+	declare -A opt_group=()   # option name -> first name on its line
+	declare -A opt_value=()   # first name -> 1 if it takes a value
+	name_re='^--?[A-Za-z0-9][A-Za-z0-9-]*,?$'
+	while IFS= read -r hl; do
+		[[ "${hl}" =~ ^--?[A-Za-z0-9] ]] || continue
+		read -r -a toks <<< "${hl}"
+		first=""
+		last=""
+		for t in "${toks[@]}"; do
+			[[ "${t}" =~ ${name_re} ]] || break
+			t="${t%,}"
+			[ -n "${first}" ] || first="${t}"
+			opt_group["${t}"]="${first}"
+			last="${t}"
+		done
+		[ -n "${first}" ] || continue
+		rest="${hl#*"${last}"}"
+		if [[ "${rest}" =~ ^[[:blank:]][^[:blank:]] ]]; then
+			opt_value["${first}"]=1
+		fi
+	done < <("${cli}" --help 2>/dev/null)
+	[ "${#opt_group[@]}" -gt 0 ] || die "Could not read the options from ${cli} --help."
+
+	# Gather [*] and the named section; a later key replaces an earlier
+	# one for the same option, so the section overrides [*].
+	want=$(router_name "${run_name}")
+	found=false
+	section=""
+	declare -A val=()
+	declare -A name_of=()
+	order=()
+	notes=()
+	env_args=()
+	while IFS= read -r line || [ -n "${line}" ]; do
+		line="${line%$'\r'}"
+		if [[ "${line}" =~ ${ini_header_re} ]]; then
+			section="${BASH_REMATCH[1]}"
+			if [ "${section}" = "${run_name}" ] \
+				|| { [ "${exact_only}" = false ] && [ "$(router_name "${section}")" = "${want}" ]; }; then
+				found=true
+				section="@target"
+			fi
+			continue
+		fi
+		[ "${section}" = "*" ] || [ "${section}" = "@target" ] || continue
+		[[ "${line}" =~ ${ini_kv_re} ]] || continue
+		key="${BASH_REMATCH[1]}"
+		value=$(ini_value "${BASH_REMATCH[2]}")
+		if [[ "${key}" == LLAMA_ARG_* ]]; then
+			env_args+=("${key}=${value}")
+			continue
+		fi
+		if [ -n "${opt_group[--${key}]+x}" ]; then
+			opt="--${key}"
+		elif [ -n "${opt_group[-${key}]+x}" ]; then
+			opt="-${key}"
+		else
+			notes+=("Skipping ${key} = ${value} (not a llama-cli option).")
+			continue
+		fi
+		# Grouped by help line, so that c and ctx-size, or kv-offload and
+		# no-kv-offload, count as one option and a later key replaces an
+		# earlier one; the name actually written is the one passed on.
+		grp="${opt_group[${opt}]}"
+		[ -n "${val[${grp}]+x}" ] || order+=("${grp}")
+		val["${grp}"]="${value}"
+		name_of["${grp}"]="${opt}"
+	done < "${ini_file}"
+	[ "${found}" = true ] || die "No section [${run_name}] in ${ini_file}."
+
+	cmd=("${cli}")
+	for grp in "${order[@]}"; do
+		value="${val[${grp}]}"
+		opt="${name_of[${grp}]}"
+		if [ -n "${opt_value[${grp}]+x}" ]; then
+			cmd+=("${opt}" "${value}")
+			continue
+		fi
+		# A flag: true passes it as written, false passes its opposite,
+		# --no-X for --X and --X for --no-X, if llama-cli has one.
+		case "${value,,}" in
+			""|true|on|yes|1) cmd+=("${opt}") ;;
+			false|off|no|0)
+				case "${opt}" in
+					--no-*) neg="--${opt#--no-}" ;;
+					--*) neg="--no-${opt#--}" ;;
+					*) neg="" ;;
+				esac
+				if [ -n "${neg}" ] && [ -n "${opt_group[${neg}]+x}" ]; then
+					cmd+=("${neg}")
+				else
+					notes+=("Skipping ${opt} = ${value} (no opposite form to pass instead).")
+				fi
+				;;
+			*) notes+=("Skipping ${opt} = ${value} (a flag, but the value is not true or false).") ;;
+		esac
+	done
+	cmd+=("${run_args[@]}")
+
+	[ "${#notes[@]}" -eq 0 ] || printf '%s\n' "${notes[@]}" >&2
+	printf 'Running:' >&2
+	[ "${#env_args[@]}" -eq 0 ] || printf ' %q' "${env_args[@]}" >&2
+	printf ' %q' "${cmd[@]}" >&2
+	printf '\n' >&2
+	exec env "${env_args[@]}" "${cmd[@]}"
+fi
+
+# ─── Starter file ───────────────────────────────────────────────────
+starter_content() {
+	cat <<STARTER
+; ${ini_file}
+;
+; Model presets for llama-server's router (--models-preset). Each
+; [section] is one model; its keys are llama-server's command-line
+; options without the leading dashes, e.g. ctx-size = 65536 or
+; cache-type-k = q8_0. The [*] section applies to every model, and a
+; model's own section overrides it.
+;
+; inillama appends a section for each new model it finds and never
+; changes or removes existing ones, so edit and rename freely. Models
+; are recognised by their "model =" path, not by the section name.
+;
+; Format: [section] and key = value lines must start in the first
+; column; only comments and blank lines may be indented. A ";" or "#"
+; anywhere starts a comment, so values can not contain them. A single
+; line llama-server can not parse makes it refuse the whole file;
+; inillama warns about such lines whenever it runs.
+;
+; Section names: llama-server rewrites the part after the last colon
+; of a section name, keeping only what follows its last "-" or "." in
+; capitals, so [x:UD-Q4_K_XL] is listed and requested as x:Q4_K_XL.
+; inillama writes names already in that form, so this file shows the
+; names clients must use. A name without a colon is used exactly as
+; written; e.g. [unsloth/gpt-oss-20b-GGUF-UD-Q4_K_XL] keeps the UD.
+;
+; Folders inillama scans: one per line, each line starting exactly
+; with "${source_prefix}" in the first column. Any other
+; comment is just a comment. A leading ~/ and \$NAME or \${NAME} are
+; expanded; avoid a literal \$ in folder names.
+${source_prefix}~/.lmstudio/models
+
+version = 1
+
+[*]
+ctx-size = 32768
+STARTER
+}
+
+created_file=false
+if [ ! -f "${ini_file}" ]; then
+	if [ "${dry_run}" = true ]; then
+		echo "Would create ${ini_file} with its starter content."
+	else
+		mkdir -p "$(dirname "${ini_file}")" || die "Could not create $(dirname "${ini_file}")."
+		starter_content > "${ini_file}" || die "Could not write ${ini_file}."
+		echo "Created ${ini_file}."
+	fi
+	created_file=true
+fi
+
+# Read from the file, or from the starter text during a dry run that
+# would have created it.
+read_ini() {
+	if [ -f "${ini_file}" ]; then
+		cat -- "${ini_file}"
+	else
+		starter_content
+	fi
+}
+
+# ─── Prune ──────────────────────────────────────────────────────────
+# A section runs from its [name] line to the line before the next
+# [name] line, except that comment and blank lines directly above the
+# next header are left with that next section, since that is where a
+# comment describing it would be written. A section is removed only if
+# it has a model = line naming an absolute path that does not exist;
+# relative paths depend on llama-server's working directory and are
+# never judged.
+pruned=()
+if [ "${do_prune}" = true ] && [ -f "${ini_file}" ]; then
+	mapfile -t lines < "${ini_file}"
+	n=${#lines[@]}
+	drop=()
+	starts=()
+	for ((i = 0; i < n; i++)); do
+		[[ "${lines[i]%$'\r'}" =~ ${ini_header_re} ]] && starts+=("${i}")
+	done
+	for ((k = 0; k < ${#starts[@]}; k++)); do
+		first=${starts[k]}
+		if [ $((k + 1)) -lt ${#starts[@]} ]; then
+			last=$((starts[k + 1] - 1))
+		else
+			last=$((n - 1))
+		fi
+		# Hand trailing comments and blanks to the following section.
+		if [ $((k + 1)) -lt ${#starts[@]} ]; then
+			while [ "${last}" -gt "${first}" ] && [[ "${lines[last]}" =~ ^[[:space:]]*([\;#].*)?$ ]]; do
+				last=$((last - 1))
+			done
+		fi
+		name="${lines[first]}"
+		name="${name#*[}"; name="${name%]*}"
+		value=""
+		for ((i = first + 1; i <= last; i++)); do
+			if [[ "${lines[i]%$'\r'}" =~ ${ini_kv_re} ]]; then
+				case "${BASH_REMATCH[1]}" in
+					model|m|LLAMA_ARG_MODEL) value=$(ini_value "${BASH_REMATCH[2]}") ;;
+				esac
+			fi
+		done
+		case "${value}" in
+			/*) ;;
+			*) continue ;;
+		esac
+		[ -e "${value}" ] && continue
+		pruned+=("[${name}] ${value}")
+		for ((i = first; i <= last; i++)); do
+			drop[i]=1
+		done
+		# Take the blank line above along, if the section ended in one
+		# too or ended the file, so that no double gaps are left behind.
+		if [ "${first}" -gt 0 ] && [[ "${lines[first - 1]}" =~ ^[[:space:]]*$ ]] \
+			&& { [ $((last + 1)) -ge "${n}" ] || [[ "${lines[last + 1]}" =~ ^[[:space:]]*$ ]] || [[ "${lines[last]}" =~ ^[[:space:]]*$ ]]; }; then
+			drop[first - 1]=1
+		fi
+	done
+	if [ "${#pruned[@]}" -gt 0 ]; then
+		if [ "${dry_run}" = true ]; then
+			echo "Would remove ${#pruned[@]} section(s) whose model file is missing:"
+		else
+			cp -p -- "${ini_file}" "${ini_file}-before_prune" || die "Could not write ${ini_file}-before_prune."
+			tmp=$(mktemp "${ini_file}.XXXXXX") || die "Could not create a temporary file beside ${ini_file}."
+			for ((i = 0; i < n; i++)); do
+				[ -n "${drop[i]+x}" ] || printf '%s\n' "${lines[i]}"
+			done > "${tmp}" || { rm -f -- "${tmp}"; die "Could not write ${tmp}."; }
+			chmod --reference="${ini_file}" -- "${tmp}" 2>/dev/null
+			mv -f -- "${tmp}" "${ini_file}" || { rm -f -- "${tmp}"; die "Could not replace ${ini_file}."; }
+			echo "Removed ${#pruned[@]} section(s) whose model file is missing (previous file kept as ${ini_file}-before_prune):"
+		fi
+		printf '  %s\n' "${pruned[@]}"
+	fi
+fi
+
+# ─── What the file already holds ────────────────────────────────────
+declare -A known_path=()     # resolved model path -> section
+declare -A known_section=()  # section name -> 1
+ini_sources=()
+section=""
+missing_report=()
+while IFS= read -r line || [ -n "${line}" ]; do
+	if [[ "${line}" == "${source_prefix}"* ]]; then
+		ini_sources+=("$(trim "${line#"${source_prefix}"}")")
+		continue
+	fi
+	line="${line%$'\r'}"
+	if [[ "${line}" =~ ${ini_header_re} ]]; then
+		section="${BASH_REMATCH[1]}"
+		known_section["$(router_name "${section}")"]=1
+		continue
+	fi
+	if [[ "${line}" =~ ${ini_kv_re} ]] && [[ "${BASH_REMATCH[1]}" =~ ^(model|m|LLAMA_ARG_MODEL)$ ]]; then
+		value=$(ini_value "${line#*=}")
+		[ -n "${value}" ] || continue
+		resolved=$(realpath -m -- "${value}" 2>/dev/null || printf '%s' "${value}")
+		known_path["${resolved}"]="${section}"
+		if [ ! -e "${value}" ] && [ "${do_prune}" = false ]; then
+			missing_report+=("[${section}] ${value}")
+		fi
+	fi
+done < <(read_ini)
+
+# ─── Section name from a path ───────────────────────────────────────
+# For the LM Studio layout publisher/repo/file.gguf the name becomes
+# publisher/repo:QUANT, the quant being what follows the model's base
+# name in the file name. The base name is the repo name without its
+# -GGUF part. Anything that does not fit falls back to the file's path
+# below the source folder, without .gguf, which is still unique.
+section_name() {
+	local rel="$1" pub repo file stem base b sep quant=""
+	stem="${rel%.[gG][gG][uU][fF]}"
+	stem=$(printf '%s' "${stem}" | sed -E 's/-0*1-of-[0-9]+$//')
+	if [[ "${rel}" =~ ^([^/]+)/([^/]+)/([^/]+)$ ]]; then
+		pub="${BASH_REMATCH[1]}"
+		repo="${BASH_REMATCH[2]}"
+		file="${stem##*/}"
+		base=$(printf '%s' "${repo}" | sed -E 's/-[Gg][Gg][Uu][Ff](-|$)/\1/; s/-$//')
+		for b in "${base}" "${base%-i1}"; do
+			for sep in - .; do
+				if [[ "${file}" == "${b}${sep}"?* ]]; then
+					quant="${file#"${b}${sep}"}"
+					break 2
+				fi
+			done
+		done
+		if [ -n "${quant}" ]; then
+			router_name "${pub}/${repo}:${quant}"
+			return 0
+		fi
+	fi
+	printf '%s' "${stem}"
+	return 1
+}
+
+# ─── Scan ───────────────────────────────────────────────────────────
+appended=""
+added=0
+clashes=()
+unwritable=()
+fallbacks=()
+declare -A run_section=()
+
+scan_source() {
+	local raw="$1" src f rel name dir mm resolved block
+	local -a mmprojs
+	if ! src=$(expand_path "${raw}"); then
+		echo "Skipping source '${raw}': cannot expand it." >&2
+		return
+	fi
+	if [ ! -d "${src}" ]; then
+		echo "Skipping source '${src}': not a folder." >&2
+		return
+	fi
+	src=$(cd -- "${src}" && pwd -P)
+	while IFS= read -r -d '' f; do
+		case "$(basename -- "${f}")" in
+			*[mM][mM][pP][rR][oO][jJ]*) continue ;;
+		esac
+		if [[ "${f}" =~ -([0-9]+)-of-[0-9]+\.[gG][gG][uU][fF]$ ]] \
+			&& [ "$((10#${BASH_REMATCH[1]}))" -ne 1 ]; then
+			continue
+		fi
+		# A broken symlink is no model; adding it would only have it
+		# pruned again.
+		[ -e "${f}" ] || continue
+		resolved=$(realpath -m -- "${f}")
+		[ -n "${known_path[${resolved}]+x}" ] && continue
+		rel="${f#"${src}"/}"
+		if [[ "${f}" == *[\;#]* ]] || [[ "${f}" =~ [[:cntrl:]] ]]; then
+			unwritable+=("${f} (the path contains ; or # or a control character)")
+			continue
+		fi
+		if ! name=$(section_name "${rel}"); then
+			fallbacks+=("[${name}] ${f}")
+		fi
+		if [[ "${name}" == *"]"* ]] || ! name_ok "${name}"; then
+			unwritable+=("${f} (its name would contain ], start with - or contain a control character)")
+			continue
+		fi
+		if [ -n "${known_section[${name}]+x}" ] || [ -n "${run_section[${name}]+x}" ]; then
+			clashes+=("[${name}] ${f}")
+			continue
+		fi
+		run_section["${name}"]=1
+		known_path["${resolved}"]="${name}"
+
+		block=$'\n'"[${name}]"$'\n'"model = ${f}"$'\n'
+		dir=$(dirname -- "${f}")
+		mmprojs=()
+		while IFS= read -r -d '' mm; do
+			mmprojs+=("${mm}")
+		done < <(find "${dir}" -maxdepth 1 \( -type f -o -type l \) -iname '*mmproj*.gguf' -print0 | sort -z)
+		if [ "${#mmprojs[@]}" -eq 1 ]; then
+			block+="mmproj = ${mmprojs[0]}"$'\n'
+		elif [ "${#mmprojs[@]}" -gt 1 ]; then
+			block+="; Several projector files were found; uncomment the right one:"$'\n'
+			for mm in "${mmprojs[@]}"; do
+				block+="; mmproj = ${mm}"$'\n'
+			done
+		fi
+		appended+="${block}"
+		added=$((added + 1))
+	done < <(find "${src}" \( -type f -o -type l \) -iname '*.gguf' -print0 | sort -z)
+}
+
+for s in "${ini_sources[@]}" "${extra_sources[@]}"; do
+	scan_source "${s}"
+done
+
+# ─── Write ──────────────────────────────────────────────────────────
+if [ "${added}" -gt 0 ]; then
+	if [ "${dry_run}" = true ]; then
+		echo "Would append ${added} section(s) to ${ini_file}:"
+		printf '%s' "${appended}"
+	else
+		# Make sure the file ends with a newline before appending.
+		if [ -s "${ini_file}" ] && [ -n "$(tail -c 1 -- "${ini_file}")" ]; then
+			printf '\n' >> "${ini_file}" || die "Could not write ${ini_file}."
+		fi
+		printf '%s' "${appended}" >> "${ini_file}" || die "Could not write ${ini_file}."
+		echo "Added ${added} section(s) to ${ini_file}:"
+		printf '%s\n' "${appended}" | sed -n 's/^\[\(.*\)\]$/  \1/p'
+	fi
+elif [ "${created_file}" = true ]; then
+	echo "No models found in the source folders yet."
+elif [ "${#pruned[@]}" -eq 0 ]; then
+	echo "No changes."
+fi
+
+if [ "${#fallbacks[@]}" -gt 0 ]; then
+	echo "These names could not be derived as publisher/repo:QUANT and use the file's path instead; rename them if you like:"
+	printf '  %s\n' "${fallbacks[@]}"
+fi
+if [ "${#unwritable[@]}" -gt 0 ]; then
+	echo "Not added, because llama-server's file format cannot hold them; rename the file or folder:" >&2
+	printf '  %s\n' "${unwritable[@]}" >&2
+fi
+if [ "${#clashes[@]}" -gt 0 ]; then
+	echo "Not added, because a section of that name already exists for another file. Add these by hand under a name of your choice:" >&2
+	printf '  %s\n' "${clashes[@]}" >&2
+fi
+if [ "${#missing_report[@]}" -gt 0 ]; then
+	echo "These sections name a model file that no longer exists. Remove them with --prune, or by hand:"
+	printf '  %s\n' "${missing_report[@]}"
+fi
+
+# ─── Reload ─────────────────────────────────────────────────────────
+# The address and port are taken from the service's unit file, so this
+# works for whatever the service was installed with.
+reload_url() {
+	local host port
+	[ -r "${unit_file}" ] || return 1
+	host=$(sed -n 's/.*--host[[:space:]]\{1,\}\([^[:space:]\\]\{1,\}\).*/\1/p' "${unit_file}" | head -1)
+	port=$(sed -n 's/.*--port[[:space:]]\{1,\}\([0-9]\{1,\}\).*/\1/p' "${unit_file}" | head -1)
+	case "${host}" in
+		""|0.0.0.0|::) host="127.0.0.1" ;;
+	esac
+	[ -n "${port}" ] || port=8080
+	printf 'http://%s:%s/models?reload=1' "${host}" "${port}"
+}
+
+if [ "${dry_run}" = true ]; then
+	exit 0
+fi
+if [ "${do_reload}" = true ]; then
+	if ! url=$(reload_url); then
+		die "No ${unit_file} found, so there is no service to reload."
+	fi
+	command -v curl >/dev/null 2>&1 || die "curl is needed for --reload."
+	if curl -fsS --max-time 30 -o /dev/null -- "${url}"; then
+		echo "llama-server re-read ${ini_file}."
+	else
+		die "Could not reach llama-server at ${url%%/models*}. Is the service running?"
+	fi
+elif [ "${added}" -gt 0 ] || [ "${#pruned[@]}" -gt 0 ]; then
+	echo "The running llama-server does not know about these changes yet. Run this again with --reload, or:"
+	if url=$(reload_url); then
+		echo "  curl -s -o /dev/null '${url}'"
+	else
+		echo "  sudo systemctl restart llama-server.service"
+	fi
+fi
+INILLAMA_SCRIPT
+	then
+		rm -f -- "${tmp}"
+		msg_fatal "Failed to write ${INILLAMA_FILE}."
+	fi
+	if ! chmod 0755 "${tmp}" || ! mv -f -- "${tmp}" "${INILLAMA_FILE}"; then
+		rm -f -- "${tmp}"
+		msg_fatal "Failed to install ${INILLAMA_FILE}."
+	fi
+	msg_ok "inillama is in place at ${INILLAMA_FILE}."
+
+	if [ "${run_after}" = "run" ]; then
+		msg_info "Running inillama to create or extend ${HOME}/${PRESET_FILE_REL}..."
+		if ! "${INILLAMA_FILE}"; then
+			msg_warn "inillama reported a problem; see above."
+		fi
+	elif [ ! -f "${HOME}/${PRESET_FILE_REL}" ]; then
+		msg_note "There is no ${HOME}/${PRESET_FILE_REL} yet. Run inillama to create it."
+	fi
+}
+
+# ─── Display name of a backend ───────────────────────────────────────
+# Backends are typed in lower case on the command line and in directory
+# names, but shown to the user as their proper names.
+backend_label() {
+	case "$1" in
+		cuda)   printf 'CUDA' ;;
+		vulkan) printf 'Vulkan' ;;
+		*)      printf '%s' "$1" ;;
+	esac
+}
+
+# ─── Newest build of a given backend ─────────────────────────────────
+# Timestamps are lexically sortable, so glob order is correct here.
+# The glob requires the timestamp shape, so a hand-renamed directory
+# such as /opt/llamacpp-cuda-old can never be taken for the newest.
+newest_build_for_backend() {
+	local backend="$1" dir newest=""
+	for dir in "${LLAMACPP_LINK}-${backend}-"[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9]-*; do
+		[ -d "${dir}" ] || continue
+		newest="${dir}"
+	done
+	if [ -z "${newest}" ]; then
+		return 1
+	fi
+	printf '%s' "${newest}"
+}
+
+# ─── Vulkan device enumeration ───────────────────────────────────────
+# Fills the global arrays vk_name[] and vk_type[], where each type is
+# one of discrete, integrated, cpu or other.
+#
+# vulkaninfo is used rather than llama-server because this has to run
+# BEFORE the build, so that the user is asked which GPU to use while
+# they are still at the keyboard rather than after a long compile.
+# The device names it reports are the Vulkan device properties, which
+# are the same strings llama-server prints later, so the chosen name
+# can be resolved to a Vulkan device position once the binary exists.
+#
+# Note that the numbering here is NOT assumed to match anything the
+# binary uses: neither ggml's own VulkanN list, which omits CPU-type
+# devices such as llvmpipe, nor the raw position that
+# GGML_VK_VISIBLE_DEVICES takes, which may be ordered differently
+# outside a desktop session. Matching is done by name for that reason.
+vulkan_enumerate() {
+	local info line cur_type="" nm
+	vk_name=()
+	vk_type=()
+	if ! info=$(vulkaninfo --summary 2>/dev/null); then
+		return 1
+	fi
+	while IFS= read -r line; do
+		case "${line}" in
+			*deviceType*=*)
+				cur_type=$(printf '%s' "${line#*= }" | sed -e 's/[[:space:]]*$//')
+				;;
+			*deviceName*=*)
+				nm=$(printf '%s' "${line#*= }" | sed -e 's/[[:space:]]*$//')
+				case "${cur_type}" in
+					*DISCRETE_GPU)   vk_type+=("discrete") ;;
+					*INTEGRATED_GPU) vk_type+=("integrated") ;;
+					*_CPU)           vk_type+=("cpu") ;;
+					*)               vk_type+=("other") ;;
+				esac
+				vk_name+=("${nm}")
+				cur_type=""
+				;;
+		esac
+	done <<< "${info}"
+	[ "${#vk_name[@]}" -gt 0 ]
+}
+
+# ─── GPU candidates, as offered to the user ─────────────────────────
+# Fills gpu_cand_name, gpu_cand_kind and gpu_cand_uuid with the GPUs
+# the user may choose between for the given backend. Entry N-1 of
+# these arrays is what both "--gpu N" and the interactive menu's
+# choice N refer to, so "--gpu list", the menu and "--gpu N" can never
+# disagree about numbering.
+#
+# Vulkan: every vulkaninfo device except CPU-type ones such as
+# llvmpipe, in vulkaninfo's order. The raw Vulkan index is NOT used
+# for pinning, since vulkaninfo, which enables window-system surface
+# extensions, may be ordered differently by Mesa's device-select layer
+# than llama-server under systemd; only the name is carried forward.
+#
+# CUDA: every GPU nvidia-smi reports, with its UUID, which
+# CUDA_VISIBLE_DEVICES accepts directly, so no post-build resolution
+# is needed and the order CUDA happens to enumerate in is irrelevant.
+#
+# Returns 1 with a message already printed if the source tool is
+# missing or reports nothing.
+gather_gpu_candidates() {
+	local i idx nm uuid
+	gpu_cand_name=()
+	gpu_cand_kind=()
+	gpu_cand_uuid=()
+	case "$1" in
+		vulkan)
+			if ! command -v vulkaninfo >/dev/null 2>&1; then
+				msg_error "vulkaninfo not found, so Vulkan devices cannot be listed."
+				return 1
+			fi
+			if ! vulkan_enumerate; then
+				msg_error "vulkaninfo reported no Vulkan devices. Check that a Vulkan driver is installed and working."
+				return 1
+			fi
+			for i in "${!vk_name[@]}"; do
+				[ "${vk_type[${i}]}" = "cpu" ] && continue
+				gpu_cand_name+=("${vk_name[${i}]}")
+				gpu_cand_kind+=("${vk_type[${i}]}")
+				gpu_cand_uuid+=("")
+			done
+			;;
+		cuda)
+			if ! command -v nvidia-smi >/dev/null 2>&1; then
+				msg_error "nvidia-smi not found, so CUDA devices cannot be listed."
+				return 1
+			fi
+			while IFS=',' read -r idx nm uuid; do
+				[ -n "${idx}" ] || continue
+				nm="${nm#"${nm%%[![:space:]]*}"}"
+				uuid="${uuid//[[:space:]]/}"
+				case "${uuid}" in
+					GPU-*) ;;
+					*) continue ;;
+				esac
+				gpu_cand_name+=("${nm}")
+				gpu_cand_kind+=("cuda")
+				gpu_cand_uuid+=("${uuid}")
+			done < <(nvidia-smi --query-gpu=index,name,uuid --format=csv,noheader 2>/dev/null)
+			;;
+	esac
+	if [ "${#gpu_cand_name[@]}" -eq 0 ]; then
+		msg_error "No usable $(backend_label "$1") GPU found."
+		return 1
+	fi
+	return 0
+}
+
+# Prints the candidates numbered from 1, the numbering --gpu N uses.
+print_gpu_candidates() {
+	local i
+	for i in "${!gpu_cand_name[@]}"; do
+		printf '  %d) %s [%s]\n' "$((i + 1))" "${gpu_cand_name[${i}]}" "${gpu_cand_kind[${i}]}"
+	done
+}
+
+# ─── Primary IPv4 address detection ─────────────────────────────────
+# Interface names are matched anchored immediately after the "N: "
+# index that `ip -o link show` prints, so that a substring appearing
+# elsewhere on the line cannot be mistaken for a device name. That
+# matters because predictable naming adds an "altname" to the same
+# line, for example "altname enx30c599ed8394" alongside enp12s0.
+#
+# Covered by the primary pattern:
+#   en*    predictable wired names: eno, ens, enp, enx
+#   eth*   traditional wired names
+#   wl*    wireless, predictable and traditional: wlp, wlo, wls, wlan
+#
+# veth* is deliberately NOT in that pattern, both because the anchor
+# would reject it anyway and because a host-side container veth
+# usually carries a bridge-internal address rather than one worth
+# binding a service to. It is tried only as a second pass, so a real
+# NIC always wins when one has an address.
+first_ipv4_for_pattern() {
+	local pattern="$1" iface addr
+	while IFS= read -r iface; do
+		addr=$(ip -o -4 addr show dev "${iface}" 2>/dev/null \
+			| awk '{print $4}' | cut -d/ -f1 | head -1)
+		if [ -n "${addr}" ]; then
+			printf '%s' "${addr}"
+			return 0
+		fi
+	done < <(ip -o link show 2>/dev/null \
+		| awk -F': ' -v pat="${pattern}" \
+			'$0 ~ pat { name = $2; sub(/@.*/, "", name); print name }')
+	return 1
+}
+
+detect_primary_ipv4() {
+	local addr
+	if addr=$(first_ipv4_for_pattern '^[0-9]+: (en|eth|wl)[^:]*:.*state UP'); then
+		printf '%s' "${addr}"
+		return 0
+	fi
+	if addr=$(first_ipv4_for_pattern '^[0-9]+: veth[^:]*:.*state UP'); then
+		printf '%s' "${addr}"
+		return 0
+	fi
+	return 1
+}
+
+# ─── Command-line arguments ──────────────────────────────────────────
+use_offline=false
+use_defaults=false
+llamacpp_version=""
+auto_yes=false
+do_uninstall=false
+backend=""
+gpu_selection=""
+activate_backend=""
+create_conf_template=true
+skip_prereq_check=false
+conf_template_failed=false
+offline_clone_arg=""
+compile_dir_arg=""
+do_list_tags=false
+do_tools=false
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-o|--offline) use_offline=true ;;
+		--offline=*)
+			use_offline=true
+			offline_clone_arg="${1#--offline=}"
+			if [ -z "${offline_clone_arg}" ]; then
+				msg_fatal "--offline= was given an empty path."
+			fi
+			reject_option_like_value "--offline" "${offline_clone_arg}"
+			;;
+		-c|--compile-directory)
+			shift
+			if [ $# -eq 0 ]; then
+				msg_fatal "--compile-directory requires a path."
+			fi
+			reject_option_like_value "--compile-directory" "$1"
+			compile_dir_arg="$1"
+			;;
+		--compile-directory=*)
+			compile_dir_arg="${1#--compile-directory=}"
+			if [ -z "${compile_dir_arg}" ]; then
+				msg_fatal "--compile-directory= was given an empty path."
+			fi
+			reject_option_like_value "--compile-directory" "${compile_dir_arg}"
+			;;
+		-d|--defaults) use_defaults=true ;;
+		-y|--yes) auto_yes=true ;;
+		-u|--uninstall) do_uninstall=true ;;
+		-t|--tools) do_tools=true ;;
+		-l|--list-tags) do_list_tags=true ;;
+		-h|--help) show_help ;;
+		--no-conf-template) create_conf_template=false ;;
+		--no-prereq-check) skip_prereq_check=true ;;
+		-b|--backend)
+			shift
+			if [ $# -eq 0 ]; then
+				msg_fatal "--backend requires a value (cuda or vulkan)"
+			fi
+			reject_option_like_value "--backend" "$1"
+			backend="$1"
+			;;
+		--backend=*)
+			backend="${1#--backend=}"
+			if [ -z "${backend}" ]; then
+				msg_fatal "--backend= was given an empty value."
+			fi
+			reject_option_like_value "--backend" "${backend}"
+			;;
+		-g|--gpu)
+			shift
+			if [ $# -eq 0 ]; then
+				msg_fatal "--gpu requires a number, or \"list\" to see the numbers."
+			fi
+			reject_option_like_value "--gpu" "$1"
+			gpu_selection="$1"
+			;;
+		--gpu=*)
+			gpu_selection="${1#--gpu=}"
+			if [ -z "${gpu_selection}" ]; then
+				msg_fatal "--gpu= was given an empty value."
+			fi
+			reject_option_like_value "--gpu" "${gpu_selection}"
+			;;
+		-a|--activate)
+			shift
+			if [ $# -eq 0 ]; then
+				msg_fatal "--activate requires a backend name (cuda or vulkan)"
+			fi
+			reject_option_like_value "--activate" "$1"
+			activate_backend="$1"
+			;;
+		--activate=*)
+			activate_backend="${1#--activate=}"
+			if [ -z "${activate_backend}" ]; then
+				msg_fatal "--activate= was given an empty value."
+			fi
+			reject_option_like_value "--activate" "${activate_backend}"
+			;;
+		-r|--release)
+			shift
+			if [ $# -eq 0 ]; then
+				msg_fatal "--release requires a version argument, for example b11069, v0.4.1, 0.4.1 or latest.\n$(tag_hint)"
+			fi
+			reject_option_like_value "--release" "$1"
+			llamacpp_version="$1"
+			;;
+		--release=*)
+			llamacpp_version="${1#--release=}"
+			if [ -z "${llamacpp_version}" ]; then
+				msg_fatal "--release= was given an empty value."
+			fi
+			reject_option_like_value "--release" "${llamacpp_version}"
+			;;
+		*) msg_fatal "Unknown argument: $1 (use --help for usage information)" ;;
+	esac
+	shift
+done
+
+# ─── Resolve paths from arguments ────────────────────────────────────
+if [ -n "${offline_clone_arg}" ]; then
+	OFFLINE_CLONE=$(resolve_path "${offline_clone_arg}")
+else
+	OFFLINE_CLONE=$(resolve_path "${DEFAULT_OFFLINE_CLONE}")
+fi
+
+if [ -n "${compile_dir_arg}" ]; then
+	COMPILE_DIR=$(resolve_path "${compile_dir_arg}")
+else
+	COMPILE_DIR=$(resolve_path "${DEFAULT_COMPILE_DIR}")
+fi
+
+# The string test catches identical spellings even when neither path
+# exists yet; -ef compares device and inode, so it also catches every
+# other spelling of an existing directory (a trailing slash, "./",
+# "../x/") and a symlink pointing at the clone.
+if [ "${OFFLINE_CLONE}" = "${COMPILE_DIR}" ] || [ "${OFFLINE_CLONE}" -ef "${COMPILE_DIR}" ]; then
+	msg_fatal "The offline clone and the compile directory are the same directory:\n  ${COMPILE_DIR}\nThe compile directory is deleted on every run, which would destroy the clone."
+fi
+
+# ─── Validate mutually exclusive modes ───────────────────────────────
+if [ -n "${activate_backend}" ] && [ "${do_uninstall}" = true ]; then
+	msg_fatal "--activate and --uninstall cannot be combined. Run them separately."
+fi
+if [ "${do_tools}" = true ] \
+	&& { [ "${do_list_tags}" = true ] || [ "${do_uninstall}" = true ] || [ -n "${activate_backend}" ]; }; then
+	msg_fatal "--tools only installs the helper tools. It cannot be combined with --list-tags, --activate or --uninstall."
+fi
+if [ "${do_list_tags}" = true ] && { [ "${do_uninstall}" = true ] || [ -n "${activate_backend}" ]; }; then
+	msg_fatal "--list-tags only lists tags. It cannot be combined with --activate or --uninstall."
+fi
+
+# ─── Validate backend names ──────────────────────────────────────────
+for value in "${backend}" "${activate_backend}"; do
+	if [ -n "${value}" ]; then
+		case "${value}" in
+			cuda|vulkan) ;;
+			rocm) msg_fatal "Backend 'rocm' is not implemented yet. Use cuda or vulkan." ;;
+			*) msg_fatal "Unknown backend '${value}'. Valid backends: cuda, vulkan" ;;
+		esac
+	fi
+done
+
+# ─── Validate --gpu shape ────────────────────────────────────────────
+# Done here rather than where the value is used, which is after the
+# build, so that a malformed --gpu costs nothing instead of costing a
+# full clone and compile before it is noticed.
+# Only the shape is checked here; whether N exists is checked once the
+# candidates have been enumerated.
+do_list_gpus=false
+if [ "${gpu_selection}" = "list" ]; then
+	do_list_gpus=true
+	gpu_selection=""
+elif [ -n "${gpu_selection}" ] && ! [[ "${gpu_selection}" =~ ^[1-9][0-9]*$ ]]; then
+	msg_fatal "--gpu takes a number from 1 upwards, or \"list\". Run with --gpu list to see the numbers."
+fi
+if [ "${do_list_gpus}" = true ] \
+	&& { [ "${do_list_tags}" = true ] || [ "${do_uninstall}" = true ] || [ -n "${activate_backend}" ]; }; then
+	msg_fatal "--gpu list only lists GPUs. It cannot be combined with --list-tags, --activate or --uninstall."
+fi
+
+# ─── Validate the offline clone ──────────────────────────────────────
+# Done here, before the sudo prompt, because it needs no privileges
+# and a wrong path should not cost a password entry first. Checked
+# once so that both the tag validation and the source copy later can
+# rely on it. Skipped for the modes that exit before using any source.
+if [ "${use_offline}" = true ] \
+	&& [ "${do_uninstall}" = false ] \
+	&& [ -z "${activate_backend}" ]; then
+	if [ ! -d "${OFFLINE_CLONE}" ]; then
+		msg_fatal "No llama.cpp clone found at:\n  ${OFFLINE_CLONE}\nCreate it once with:\n  git clone https://github.com/ggml-org/llama.cpp ${OFFLINE_CLONE}\nOr point --offline= at an existing clone, or change DEFAULT_OFFLINE_CLONE near the top of this script."
+	fi
+	if ! is_llamacpp_source "${OFFLINE_CLONE}"; then
+		msg_fatal "The directory below exists but does not look like a llama.cpp source tree:\n  ${OFFLINE_CLONE}\nExpected to find both CMakeLists.txt and include/llama.h in it."
+	fi
+fi
+
+# ─── List tags mode ──────────────────────────────────────────────────
+# Which source is used follows --offline exactly, rather than
+# preferring one silently. Asking for a listing without --offline and
+# being served a months-old clone would be as wrong as asking for the
+# clone's tags and being served GitHub's.
+#
+# Needs no privileges, so it runs before the root and sudo checks.
+if [ "${do_list_tags}" = true ]; then
+	if [ "${use_offline}" = true ]; then
+		# Sorted by tag date rather than by name, and with no pattern
+		# filter, so the order stays correct no matter how the project
+		# names things. A version sort would rank every v tag above
+		# every b tag rather than showing them by recency.
+		tags=$(git -C "${OFFLINE_CLONE}" tag -l --sort=-creatordate 2>/dev/null \
+			| head -"${LIST_TAGS_COUNT}")
+		if [ -z "${tags}" ]; then
+			msg_fatal "No tags found in ${OFFLINE_CLONE}."
+		fi
+		msg_info "${LIST_TAGS_COUNT} most recent tags in ${OFFLINE_CLONE}:"
+		printf '%s\n' "${tags}"
+		printf '\n'
+		msg_info "Source: local clone. These are git tags, newest first by tag date."
+	else
+		if ! command -v curl >/dev/null 2>&1; then
+			msg_fatal "curl is needed to query GitHub for tags.\nPlease install the applicable equivalent of: curl\nOr list the tags in a local clone instead with:\n  $(basename "$0") --list-tags --offline"
+		fi
+
+		api_url="https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=${LIST_TAGS_COUNT}"
+		msg_info "Querying GitHub for the ${LIST_TAGS_COUNT} most recent releases..."
+		if ! api_response=$(curl -sS --max-time 20 "${api_url}" 2>&1); then
+			msg_fatal "Could not reach the GitHub API.\n${api_response}\nIf this machine is offline, list the tags in a local clone instead with:\n  $(basename "$0") --list-tags --offline"
+		fi
+
+		tags=$(printf '%s' "${api_response}" | grep -oP '"tag_name":\s*"\K[^"]+')
+		if [ -z "${tags}" ]; then
+			# A reply arrived but held no tags. The usual cause is the
+			# unauthenticated rate limit of 60 requests per hour, which
+			# comes back as an ordinary JSON body carrying a message
+			# rather than as a transport failure.
+			api_message=$(printf '%s' "${api_response}" | grep -oP '"message":\s*"\K[^"]+' | head -1)
+			if [ -n "${api_message}" ]; then
+				msg_fatal "GitHub returned no tags. It said:\n  ${api_message}\nList the tags in a local clone instead with:\n  $(basename "$0") --list-tags --offline"
+			fi
+			msg_fatal "GitHub returned a reply containing no tags.\nList the tags in a local clone instead with:\n  $(basename "$0") --list-tags --offline"
+		fi
+
+		printf '\n'
+		printf '%s\n' "${tags}"
+		printf '\n'
+		msg_info "Source: GitHub releases API, newest first by publication date."
+	fi
+	exit 0
+fi
+
+# ─── Pre-flight: am I root? ─────────────────────────────────────────
+if [ "$(id -u)" -eq 0 ]; then
+	msg_fatal "Do not run this script as root. Run as a regular user with sudo access."
+fi
+
+# ─── Tools mode ─────────────────────────────────────────────────────
+# Everything the tools need lives in the user's home, so this needs no
+# sudo and runs before any privilege is requested.
+if [ "${do_tools}" = true ]; then
+	install_inillama
+	exit 0
+fi
+
+# ─── Privilege acquisition ──────────────────────────────────────────
+# Sudo is obtained at the point of first need rather than up front,
+# so that validation and prompts, none of which need privileges, can
+# fail or complete without ever asking for a password. Idempotent, so
+# callers need not coordinate with each other.
+sudo_ready=false
+require_sudo() {
+	[ "${sudo_ready}" = true ] && return 0
+	msg_info "Checking sudo access..."
+	if ! sudo -v 2>/dev/null; then
+		msg_fatal "Cannot obtain sudo privileges. This script requires sudo for installing to /opt and writing to /etc."
+	fi
+	# Refresh the sudo timestamp in the background so it cannot expire
+	# during a long compile. Killed by the exit trap.
+	( while kill -0 $$ 2>/dev/null; do sudo -n -v 2>/dev/null; sleep 120; done ) &
+	SUDO_KEEPALIVE_PID=$!
+	sudo_ready=true
+}
+
+# ─── Exit cleanup ───────────────────────────────────────────────────
+# Stops the sudo keepalive, and removes the install prefix if the run
+# ended before the install completed, so that failed or interrupted
+# runs do not leave orphaned directories accumulating under /opt.
+# The case guard means only a path this script itself generated can
+# ever be removed, no matter what the variable happens to contain.
+install_completed=false
+DOTS_PID=""
+cleanup() {
+	# The dots subshell is killed first so that an interrupted compile
+	# stops printing immediately, rather than continuing until its own
+	# parent check next runs.
+	if [ -n "${DOTS_PID:-}" ]; then
+		kill "${DOTS_PID}" 2>/dev/null
+		DOTS_PID=""
+		printf '\n'
+	fi
+	if [ -n "${SUDO_KEEPALIVE_PID:-}" ]; then
+		kill "${SUDO_KEEPALIVE_PID}" 2>/dev/null
+		SUDO_KEEPALIVE_PID=""
+	fi
+	if [ "${install_completed}" = false ] && [ -n "${LLAMACPP_PREFIX:-}" ]; then
+		case "${LLAMACPP_PREFIX}" in
+			/opt/llamacpp-*-[0-9]*)
+				if [ -d "${LLAMACPP_PREFIX}" ]; then
+					if sudo rm -rf "${LLAMACPP_PREFIX}" 2>/dev/null; then
+						printf '%sRemoved incomplete install prefix %s%s\n' \
+							"${c_yellow}" "${LLAMACPP_PREFIX}" "${c_reset}"
+					fi
+				fi
+				;;
+		esac
+	fi
+}
+trap cleanup EXIT
+
+# ─── Activate mode ──────────────────────────────────────────────────
+# Repoint the symlink at an existing build of the named backend.
+# Order matters: the service must be stopped before the libraries
+# under /opt/llamacpp change, and ldconfig must run before it starts
+# again or the linker cache still holds the previous backend's
+# libraries. A failed ldconfig here means the system is in an
+# inconsistent state, so the script stops rather than starting the
+# service on top of it.
+if [ -n "${activate_backend}" ]; then
+	msg_info "Activate mode: switching to the most recent $(backend_label "${activate_backend}") build..."
+
+	# Validated before sudo, since finding the target needs no
+	# privileges and a missing build should not cost a password.
+	if ! target=$(newest_build_for_backend "${activate_backend}"); then
+		msg_fatal "No build found matching ${LLAMACPP_LINK}-${activate_backend}-*. Compile it first with --backend ${activate_backend}."
+	fi
+	msg_info "Selected ${target}."
+
+	require_sudo
+
+	# Recorded before stopping, so that a service the user had stopped
+	# on purpose is not started behind their back.
+	service_was_active=false
+	if [ -f "${SERVICE_FILE}" ] && service_is_active; then
+		service_was_active=true
+		msg_info "Stopping llama-server.service..."
+		sudo systemctl stop llama-server.service 2>/dev/null
+	fi
+
+	msg_info "Repointing ${LLAMACPP_LINK} -> ${target}..."
+	if ! sudo ln -sfnT "${target}" "${LLAMACPP_LINK}"; then
+		msg_fatal "Failed to repoint ${LLAMACPP_LINK}."
+	fi
+
+	msg_info "Running ldconfig..."
+	if ! sudo ldconfig; then
+		msg_fatal "ldconfig failed. Not starting the service — resolve this before continuing, as the dynamic linker cache may still reference the previous backend."
+	fi
+	msg_ok "ldconfig completed."
+
+	if [ "${service_was_active}" = true ]; then
+		if ensure_service_presets; then
+			msg_info "Starting llama-server.service..."
+			if sudo systemctl start llama-server.service; then
+				confirm_service_running
+			else
+				msg_warn "Failed to start llama-server.service. Check with: journalctl -u llama-server.service -e"
+			fi
+		fi
+	elif [ -f "${SERVICE_FILE}" ]; then
+		msg_note "llama-server.service was not running, so it was left stopped."
+		msg_note "Start it with: sudo systemctl start llama-server.service"
+	else
+		msg_info "No llama-server.service present, nothing to restart."
+	fi
+
+	msg_ok "Now active: ${target}"
+	msg_info "To activate in the current shell, run: source /etc/profile"
+	exit 0
+fi
+
+# ─── Uninstall mode ─────────────────────────────────────────────────
+# When -u is specified, remove system integration and exit.
+# Does NOT remove compiled binaries in /opt, and never touches
+# /etc/localllama.conf, which is user-managed.
+if [ "${do_uninstall}" = true ]; then
+	require_sudo
+	msg_info "Uninstall mode: removing system integration for llama.cpp..."
+
+	# ── Stop and remove systemd service ──
+	if [ -f "${SERVICE_FILE}" ] && ! created_by_compllama "${SERVICE_FILE}"; then
+		msg_warn "${SERVICE_FILE} does not look like one compllama created, so it was left in place."
+		msg_info "Remove it by hand if you want it gone."
+	elif [ -f "${SERVICE_FILE}" ]; then
+		msg_info "Stopping and disabling llama-server.service..."
+		sudo systemctl stop llama-server.service 2>/dev/null
+		sudo systemctl disable llama-server.service 2>/dev/null
+		if ! sudo rm -f "${SERVICE_FILE}"; then
+			msg_fatal "Failed to remove ${SERVICE_FILE}."
+		fi
+		sudo systemctl daemon-reload
+		msg_ok "llama-server.service removed."
+	else
+		msg_info "llama-server.service not found, skipping."
+	fi
+
+	# ── Remove inillama ──
+	if [ -f "${INILLAMA_FILE}" ] && ! created_by_compllama "${INILLAMA_FILE}"; then
+		msg_warn "${INILLAMA_FILE} does not look like one compllama created, so it was left in place."
+	elif [ -f "${INILLAMA_FILE}" ]; then
+		if ! rm -f "${INILLAMA_FILE}"; then
+			msg_fatal "Failed to remove ${INILLAMA_FILE}."
+		fi
+		msg_ok "Removed ${INILLAMA_FILE}."
+	else
+		msg_info "inillama not found at ${INILLAMA_FILE}, skipping."
+	fi
+
+	# ── Remove managed bloc from ld.so.conf.d ──
+	if [ -f "${LDCONF_FILE}" ]; then
+		existing=$(sudo cat "${LDCONF_FILE}")
+		cleaned=$(echo "${existing}" | sed "/${BLOC_BEGIN//\//\\/}/,/${BLOC_END//\//\\/}/d")
+		# Strip leading/trailing blank lines.
+		cleaned=$(echo "${cleaned}" | sed '/./,$!d' | sed -e :a -e '/^[[:space:]]*$/{ $d; N; ba; }')
+		if [ -z "${cleaned}" ]; then
+			if ! sudo rm -f "${LDCONF_FILE}"; then
+				msg_fatal "Failed to remove ${LDCONF_FILE}."
+			fi
+			msg_ok "Removed ${LDCONF_FILE} (no content remained after removing managed bloc)."
+		else
+			if ! echo "${cleaned}" | sudo tee "${LDCONF_FILE}" >/dev/null; then
+				msg_fatal "Failed to write ${LDCONF_FILE}."
+			fi
+			msg_ok "Removed managed bloc from ${LDCONF_FILE} (other content preserved)."
+		fi
+		sudo ldconfig
+	else
+		msg_info "${LDCONF_FILE} not found, skipping."
+	fi
+
+	# ── Remove managed bloc from profile.d ──
+	if [ -f "${PROFILE_FILE}" ]; then
+		existing=$(sudo cat "${PROFILE_FILE}")
+		cleaned=$(echo "${existing}" | sed "/${BLOC_BEGIN//\//\\/}/,/${BLOC_END//\//\\/}/d")
+		# Strip leading/trailing blank lines.
+		cleaned=$(echo "${cleaned}" | sed '/./,$!d' | sed -e :a -e '/^[[:space:]]*$/{ $d; N; ba; }')
+		# Check if only shebang and/or comment-only header lines remain.
+		meaningful=$(echo "${cleaned}" | grep -vE '^(#|$)' || true)
+		if [ -z "${meaningful}" ]; then
+			if ! sudo rm -f "${PROFILE_FILE}"; then
+				msg_fatal "Failed to remove ${PROFILE_FILE}."
+			fi
+			msg_ok "Removed ${PROFILE_FILE} (no meaningful content remained after removing managed bloc)."
+		else
+			if ! echo "${cleaned}" | sudo tee "${PROFILE_FILE}" >/dev/null; then
+				msg_fatal "Failed to write ${PROFILE_FILE}."
+			fi
+			msg_ok "Removed managed bloc from ${PROFILE_FILE} (other content preserved)."
+		fi
+	else
+		msg_info "${PROFILE_FILE} not found, skipping."
+	fi
+
+	msg_ok "Uninstall complete."
+	msg_info "Compiled binaries in /opt/llamacpp* were NOT removed."
+	msg_info "To remove them manually: sudo rm -rf /opt/llamacpp /opt/llamacpp-*"
+	if [ -f "${PERSISTENT_CONF}" ]; then
+		msg_info "${PERSISTENT_CONF} was left untouched (user-managed)."
+	fi
+	if [ -f "${HOME}/${PRESET_FILE_REL}" ]; then
+		msg_info "${HOME}/${PRESET_FILE_REL} was left untouched (user-managed)."
+	fi
+	exit 0
+fi
+
+# ─── Resolve backend ─────────────────────────────────────────────────
+if [ -z "${backend}" ]; then
+	msg_info "No backend specified, auto-detecting..."
+	if ! vendor=$(detect_gpu_vendor); then
+		msg_fatal "No nVidia or AMD GPU found in sysfs. Specify the backend explicitly with --backend cuda|vulkan."
+	fi
+	case "${vendor}" in
+		nvidia)
+			backend="cuda"
+			msg_ok "nVidia GPU detected — selecting the CUDA backend."
+			;;
+		amd)
+			backend="vulkan"
+			msg_ok "AMD GPU detected and no nVidia GPU present — selecting the Vulkan backend."
+			;;
+	esac
+	msg_info "Override this with --backend if it is not what you want."
+else
+	msg_info "Backend: $(backend_label "${backend}") (specified explicitly)."
+fi
+
+# ─── List GPUs mode ──────────────────────────────────────────────────
+# Needs the backend, since the list depends on it, but no network and
+# no privileges, so it runs before the connectivity check and exits.
+if [ "${do_list_gpus}" = true ]; then
+	if ! gather_gpu_candidates "${backend}"; then
+		exit 1
+	fi
+	msg_info "Candidate GPUs for the $(backend_label "${backend}") backend:"
+	print_gpu_candidates
+	msg_info "Pin one with --gpu N."
+	exit 0
+fi
+
+# ─── Decision: which GPU to pin to ───────────────────────────────────
+# Settled first of all the questions, straight after the backend is
+# known, because it is the one decision that can reject the command
+# line: an out-of-range --gpu N must fail within a second, not after
+# the network check, the prerequisite check and every other question.
+# It needs only the backend; the tool it consults is checked for here. With --gpu N the choice is taken
+# from the same numbered list "--gpu list" prints. Without it, only
+# Vulkan needs a decision: CUDA never enumerates an integrated GPU, so
+# it is left unrestricted unless pinned explicitly.
+#
+# The result is a device NAME, plus a UUID for CUDA. A Vulkan name is
+# resolved to a device position after the build, once llama-server
+# exists to be asked.
+selected_gpu_name=""
+selected_gpu_uuid=""
+
+if [ -n "${gpu_selection}" ] || [ "${backend}" = "vulkan" ]; then
+	msg_info "Enumerating $(backend_label "${backend}") devices..."
+	if ! gather_gpu_candidates "${backend}"; then
+		msg_fatal "Cannot choose a GPU. Fix the problem above, or for CUDA omit --gpu to leave the build unrestricted."
+	fi
+	discrete_candidates=()
+	for i in "${!gpu_cand_name[@]}"; do
+		if [ "${gpu_cand_kind[${i}]}" = "discrete" ]; then
+			discrete_candidates+=("${i}")
+		fi
+	done
+	chosen=""
+
+	if [ -n "${gpu_selection}" ]; then
+		if [ "${gpu_selection}" -gt "${#gpu_cand_name[@]}" ]; then
+			msg_error "--gpu ${gpu_selection} is out of range. The candidates are:"
+			print_gpu_candidates
+			msg_fatal "Choose a number from the list above."
+		fi
+		chosen=$((gpu_selection - 1))
+		msg_ok "Selected by --gpu ${gpu_selection}: ${gpu_cand_name[${chosen}]}"
+	elif [ "${#discrete_candidates[@]}" -eq 1 ]; then
+		chosen="${discrete_candidates[0]}"
+		msg_ok "Selected the only discrete GPU: ${gpu_cand_name[${chosen}]}"
+	elif [ "${#gpu_cand_name[@]}" -eq 1 ]; then
+		# For example an APU whose integrated GPU is the intended
+		# inference device.
+		chosen=0
+		msg_ok "Selected the only GPU: ${gpu_cand_name[${chosen}]}"
+	elif [ "${use_defaults}" = true ] || [ "${auto_yes}" = true ]; then
+		msg_error "Cannot choose a GPU automatically: found ${#discrete_candidates[@]} discrete device(s) among:"
+		print_gpu_candidates
+		msg_fatal "Running non-interactively, so there is nobody to ask. Re-run with --gpu N, choosing N from the list above."
+	else
+		msg_warn "Cannot choose a GPU automatically: found ${#discrete_candidates[@]} discrete device(s)."
+		printf '\n'
+		print_gpu_candidates
+		printf '\n'
+		while true; do
+			printf '%s' "${c_bold}Choose a GPU [1-${#gpu_cand_name[@]}]: ${c_reset}"
+			read -r answer || msg_fatal "No input (end of file). Run interactively, or use -d."
+			if [[ "${answer}" =~ ^[1-9][0-9]*$ ]] \
+				&& [ "${answer}" -le "${#gpu_cand_name[@]}" ]; then
+				chosen=$((answer - 1))
+				break
+			fi
+			msg_warn "Enter a number between 1 and ${#gpu_cand_name[@]}."
+		done
+		msg_ok "Selected: ${gpu_cand_name[${chosen}]}"
+		msg_info "Next time, --gpu $((chosen + 1)) selects it without asking."
+	fi
+
+	selected_gpu_name="${gpu_cand_name[${chosen}]}"
+	selected_gpu_uuid="${gpu_cand_uuid[${chosen}]}"
+fi
+
+# ─── Prerequisites ───────────────────────────────────────────────────
+# Checked before the network and tag checks, since those use git and
+# a missing git would otherwise be reported as a network failure.
+# Checked by capability rather than by package, so that this works on
+# any distribution rather than only on RPM ones. Nothing here consults
+# a package manager: a command is looked for on PATH, or a development
+# library is looked for through pkg-config, which is the mechanism
+# cmake itself uses and which reports the same answer everywhere.
+#
+# Package names appear only in the failure message, as a hint for
+# translating into whatever the local package manager calls them. No
+# decision is ever made from them.
+#
+# This check guarantees nothing. Its only job is to fail earlier and
+# more legibly than cmake would. A wrong pass simply means cmake
+# complains a few seconds later, whereas a wrong failure would block a
+# build that would have worked, so the tests are deliberately
+# permissive and --no-prereq-check exists for anything they get wrong.
+
+# True if any one of the named commands is on PATH.
+have_command() {
+	local candidate
+	for candidate in "$@"; do
+		if command -v "${candidate}" >/dev/null 2>&1; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# True if pkg-config knows any one of the named modules. Module names
+# are matched case-insensitively, because SPIRV-Headers is spelled that
+# way on some systems and spirv-headers on others.
+have_pkgconfig_module() {
+	local wanted available
+	available=$(pkg-config --list-all 2>/dev/null | awk '{print tolower($1)}')
+	for wanted in "$@"; do
+		if printf '%s\n' "${available}" | grep -qxF "$(printf '%s' "${wanted}" | tr '[:upper:]' '[:lower:]')"; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+missing_what=()
+missing_hint=()
+
+note_missing() {
+	missing_what+=("$1")
+	missing_hint+=("$2")
+}
+
+# check_command <description> <hint package> <command> [alternatives...]
+check_command() {
+	local label="$1" hint="$2"
+	shift 2
+	have_command "$@" || note_missing "${label}" "${hint}"
+}
+
+# check_module <description> <hint package> <module> [alternatives...]
+check_module() {
+	local label="$1" hint="$2"
+	shift 2
+	have_pkgconfig_module "$@" || note_missing "${label}" "${hint}"
+}
+
+if [ "${skip_prereq_check}" = true ]; then
+	msg_warn "Skipping prerequisite checks as requested (--no-prereq-check)."
+	msg_warn "Anything missing will surface later, as a cmake error or as a failure to run vulkaninfo."
+else
+	msg_info "Checking prerequisites for the $(backend_label "${backend}") backend..."
+
+	# pkg-config is checked first and separately, because the library
+	# tests below are meaningless without it and would otherwise all
+	# fail at once, burying the real cause.
+	pkgconfig_available=true
+	if ! have_command pkg-config pkgconf; then
+		pkgconfig_available=false
+		note_missing "pkg-config" "pkgconf-pkg-config"
+	fi
+
+	check_command "cmake"      "cmake"    cmake
+	check_command "C compiler" "gcc"      gcc
+	check_command "C++ compiler" "gcc-c++" g++
+	check_command "git"        "git"      git
+	check_command "make"       "make"     make
+
+	case "${backend}" in
+		vulkan)
+			# The glslang binary is called glslangValidator on some
+			# systems and glslang on others; either will do.
+			check_command "glslang"  "glslang"   glslang glslangValidator
+			check_command "glslc"    "glslc"     glslc
+			check_command "vulkaninfo" "vulkan-tools" vulkaninfo
+			if [ "${pkgconfig_available}" = true ]; then
+				check_module "Vulkan development files" "vulkan-loader-devel" vulkan
+				check_module "SPIR-V headers" "spirv-headers-devel" SPIRV-Headers
+			fi
+			;;
+		cuda)
+			check_command "nvcc" "the CUDA Toolkit" nvcc
+			;;
+	esac
+
+	if [ "${#missing_what[@]}" -gt 0 ]; then
+		msg_error "The following ${#missing_what[@]} prerequisite(s) were not found:"
+		hint_list=()
+		cuda_missing=false
+		for i in "${!missing_what[@]}"; do
+			printf '  %s\n' "${missing_what[${i}]}"
+			if [ "${missing_what[${i}]}" = "nvcc" ]; then
+				cuda_missing=true
+			else
+				hint_list+=("${missing_hint[${i}]}")
+			fi
+		done
+		printf '\n'
+
+		if [ "${#hint_list[@]}" -gt 0 ]; then
+			msg_info "Please install the applicable equivalent of:"
+			printf '  %s\n' "${hint_list[*]}"
+			printf '\n'
+		fi
+
+		if [ "${cuda_missing}" = true ]; then
+			msg_info "nvcc is part of the CUDA Toolkit, which is distributed by nVidia:"
+			printf '  https://developer.nvidia.com/cuda-downloads\n'
+			printf '\n'
+			msg_warn "Two things those instructions leave you to work out:"
+			msg_warn "  Every package name carries the CUDA version, so there is no plain"
+			msg_warn "  'cuda-nvcc' to ask for. The toolkit meta-package pulls it in."
+			msg_warn "  Nothing puts nvcc on PATH. Add /usr/local/cuda/bin to PATH,"
+			msg_warn "  typically from a file in /etc/profile.d/, or nvcc stays"
+			msg_warn "  invisible once installed. If \"ldconfig -p | grep libcudart\""
+			msg_warn "  then finds nothing, also list the toolkit's library directory"
+			msg_warn "  in a file in /etc/ld.so.conf.d/ and run ldconfig, since the"
+			msg_warn "  service never sees LD_LIBRARY_PATH."
+		fi
+		exit 1
+	fi
+	msg_ok "All prerequisites found."
+fi
+
+# ─── Pre-flight: network connectivity ───────────────────────────────
+if [ "${use_offline}" = false ]; then
+	msg_info "Checking network connectivity..."
+	if ! git ls-remote --exit-code https://github.com/ggml-org/llama.cpp HEAD >/dev/null 2>&1; then
+		msg_fatal "Cannot reach https://github.com/ggml-org/llama.cpp — check your network connection."
+	fi
+fi
+
+# ─── Pre-flight: validate requested llama.cpp version tag ────────────
+# Check that the requested tag exists BEFORE touching any existing
+# source directories.
+#
+# A bare number is ambiguous on its own, so it is resolved by shape:
+# llama.cpp names its releases with dots (v0.4.1) and its nightly
+# builds without (b11067), so a dotted number gets "v" and an undotted
+# one gets "b". Anything containing a character outside digits and
+# dots is taken literally, which covers b11067, v0.4.1 and any custom
+# tag. A release named with no dot at all, should one ever appear,
+# is still reachable by passing it in full as --release v5.
+release_tag="${llamacpp_version}"
+if [ -n "${llamacpp_version}" ] && [ "${llamacpp_version}" != "latest" ]; then
+	case "${llamacpp_version}" in
+		*[!0-9.]*) release_tag="${llamacpp_version}" ;;
+		*.*)       release_tag="v${llamacpp_version}" ;;
+		*)         release_tag="b${llamacpp_version}" ;;
+	esac
+	if [ "${release_tag}" != "${llamacpp_version}" ]; then
+		msg_info "Interpreting --release ${llamacpp_version} as tag ${release_tag}."
+	fi
+
+	msg_info "Validating that llama.cpp tag '${release_tag}' exists..."
+	if [ "${use_offline}" = true ]; then
+		if ! git -C "${OFFLINE_CLONE}" rev-parse "${release_tag}" >/dev/null 2>&1; then
+			msg_fatal "Tag '${release_tag}' does not exist in ${OFFLINE_CLONE}.\n$(tag_hint)"
+		fi
+	else
+		if ! git ls-remote --tags --exit-code https://github.com/ggml-org/llama.cpp "refs/tags/${release_tag}" >/dev/null 2>&1; then
+			msg_fatal "Tag '${release_tag}' does not exist on the llama.cpp remote.\n$(tag_hint)"
+		fi
+	fi
+	msg_ok "llama.cpp tag '${release_tag}' is valid."
+fi
+
+# ─── Backend-specific configuration ──────────────────────────────────
+cuda_arch="${DEFAULT_CUDA_ARCH}"
+
+if [ "${backend}" = "cuda" ]; then
+	if [ -z "${cuda_arch}" ]; then
+		msg_info "Auto-detecting CUDA compute capability..."
+		if ! command -v nvidia-smi >/dev/null 2>&1; then
+			msg_fatal "nvidia-smi not found, cannot auto-detect the compute capability. Set DEFAULT_CUDA_ARCH near the top of this script (e.g. 89 for an RTX 4070 SUPER)."
+		fi
+		cuda_arch=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
+		if ! [[ "${cuda_arch}" =~ ^[0-9]+$ ]]; then
+			msg_fatal "Could not read the compute capability from nvidia-smi (got '${cuda_arch}'). Set DEFAULT_CUDA_ARCH near the top of this script."
+		fi
+		msg_ok "Detected CUDA compute capability ${cuda_arch}."
+	elif ! [[ "${cuda_arch}" =~ ^[0-9]+$ ]]; then
+		msg_fatal "DEFAULT_CUDA_ARCH must be digits only, such as 89, not '${cuda_arch}'."
+	else
+		msg_info "Using configured CUDA compute capability ${cuda_arch}."
+	fi
+fi
+
+# ─── Configuration ───────────────────────────────────────────────────
+# The timestamp is fixed here so that it reflects when the run began.
+# The full prefix cannot be built yet because its reference component
+# comes from git describe, which needs the source checked out first.
+BUILD_TIMESTAMP="$(date '+%Y%m%dT%H%M')"
+
+# ═══════════════════════════════════════════════════════════════════════
+# Collect all user input upfront so the rest runs unattended.
+# (The GPU choice was already settled right after the backend.)
+# ═══════════════════════════════════════════════════════════════════════
+
+# ─── Decision: compile directory removal ─────────────────────────────
+# This is the only destructive operation in the script, and the path
+# is user-supplied, so the target has to prove it is a llama.cpp build
+# tree before anything is removed. The identity check runs before the
+# -y and -d shortcuts rather than after, so those skip a confirmation
+# prompt but never skip the safety check.
+remove_source=false
+if [ -e "${COMPILE_DIR}" ]; then
+	if ! is_llamacpp_source "${COMPILE_DIR}"; then
+		msg_fatal "Refusing to remove the compile directory:\n  ${COMPILE_DIR}\nIt exists but does not look like a llama.cpp source tree, as it lacks CMakeLists.txt, include/llama.h, or both.\nRemove it yourself if that really is what you intended, or point --compile-directory= somewhere else."
+	fi
+	if [ "${use_defaults}" = true ] || [ "${auto_yes}" = true ]; then
+		remove_source=true
+	else
+		msg_warn "The compile directory ${COMPILE_DIR} already exists."
+		msg_warn "It must be removed to ensure a clean build. Answering 'no' will abort the script."
+		printf '%s' "${c_bold}Remove ${COMPILE_DIR} and all its contents? [Y/n]: ${c_reset}"
+		read -r answer || msg_fatal "No input (end of file). Run interactively, or use -d."
+		if [[ -z "${answer}" || "${answer}" =~ ^[Yy]$ ]]; then
+			remove_source=true
+		else
+			msg_fatal "Aborted by user. Remove or rename ${COMPILE_DIR} manually, then re-run."
+		fi
+	fi
+fi
+
+# ─── Decision: llama-server.service installation ─────────────────────
+# The defaults are resolved here rather than at the top of the script
+# so that --help, --uninstall and --activate never invoke ip(8), and
+# so that a failed host detection can be reported at the moment the
+# value would actually be used.
+if [ ! -f "${SERVICE_FILE}" ]; then
+	if [ -z "${DEFAULT_SERVICE_USER}" ]; then
+		DEFAULT_SERVICE_USER="${USER}"
+	fi
+
+	host_detection_failed=false
+	if [ -z "${DEFAULT_SERVICE_HOST}" ]; then
+		if ! DEFAULT_SERVICE_HOST=$(detect_primary_ipv4); then
+			DEFAULT_SERVICE_HOST="0.0.0.0"
+			host_detection_failed=true
+		fi
+	fi
+
+	if [ "${host_detection_failed}" = true ]; then
+		msg_warn "Could not determine this machine's IPv4 address from any UP en*, eth*, wl* or veth* interface."
+		msg_warn "Falling back to 0.0.0.0, which makes llama-server listen on every interface."
+		msg_warn "That is usually fine behind a NAT router with a host firewall, but it is broader than binding to one address."
+		msg_info "Set DEFAULT_SERVICE_HOST near the top of this script, or answer the host prompt below, to pin it."
+	fi
+fi
+
+install_service=false
+service_user="${DEFAULT_SERVICE_USER}"
+service_port="${DEFAULT_SERVICE_PORT}"
+service_host="${DEFAULT_SERVICE_HOST}"
+
+if [ ! -f "${SERVICE_FILE}" ]; then
+	if [ "${use_defaults}" = true ]; then
+		install_service=true
+		msg_info "Service ${SERVICE_FILE} not found. Will install with defaults (-d)."
+	else
+		msg_info "No llama-server systemd service found at ${SERVICE_FILE}."
+		printf '%s' "${c_bold}Install llama-server.service? [Y/n]: ${c_reset}"
+		read -r answer || msg_fatal "No input (end of file). Run interactively, or use -d."
+		if [[ -z "${answer}" || "${answer}" =~ ^[Yy]$ ]]; then
+			install_service=true
+
+			printf '%s' "${c_bold}Username for the service to run as [${DEFAULT_SERVICE_USER}]: ${c_reset}"
+			read -r answer || msg_fatal "No input (end of file). Run interactively, or use -d."
+			if [ -n "${answer}" ]; then
+				service_user="${answer}"
+			fi
+
+			printf '%s' "${c_bold}Port for llama-server [${DEFAULT_SERVICE_PORT}]: ${c_reset}"
+			read -r answer || msg_fatal "No input (end of file). Run interactively, or use -d."
+			if [ -n "${answer}" ]; then
+				service_port="${answer}"
+			fi
+
+			printf '%s' "${c_bold}Host/IP to bind to [${DEFAULT_SERVICE_HOST}]: ${c_reset}"
+			read -r answer || msg_fatal "No input (end of file). Run interactively, or use -d."
+			if [ -n "${answer}" ]; then
+				service_host="${answer}"
+			fi
+		fi
+	fi
+
+	# Validate the username exists on the system.
+	if [ "${install_service}" = true ]; then
+		if ! id "${service_user}" >/dev/null 2>&1; then
+			msg_fatal "User '${service_user}' does not exist on this system. Cannot create service."
+		fi
+	fi
+else
+	msg_info "llama-server.service already exists, will not modify it."
+fi
+
+# ─── Decision: inillama installation ─────────────────────────────────
+install_inillama=false
+
+if [ ! -f "${INILLAMA_FILE}" ]; then
+	if [ "${use_defaults}" = true ]; then
+		install_inillama=true
+		msg_info "inillama not found at ${INILLAMA_FILE}. Will install (-d)."
+	else
+		msg_info "No inillama script found at ${INILLAMA_FILE}."
+		printf '%s' "${c_bold}Install inillama model-preset helper? [Y/n]: ${c_reset}"
+		read -r answer || msg_fatal "No input (end of file). Run interactively, or use -d."
+		if [[ -z "${answer}" || "${answer}" =~ ^[Yy]$ ]]; then
+			install_inillama=true
+		fi
+	fi
+else
+	msg_info "inillama already exists at ${INILLAMA_FILE}, will not modify it. Update it with --tools."
+fi
+
+# ═══════════════════════════════════════════════════════════════════════
+# All questions answered. Everything below runs unattended.
+# ═══════════════════════════════════════════════════════════════════════
+msg_ok "All input collected."
+
+# Obtained here, after every question and before the first destructive
+# or privileged step, so that the whole run needs exactly one password
+# and a sudo failure cannot leave the compile directory already gone.
+require_sudo
+
+msg_ok "Proceeding with the $(backend_label "${backend}") build..."
+
+# ─── Acquire source ─────────────────────────────────────────────────
+if [ "${remove_source}" = true ]; then
+	msg_info "Removing existing ${COMPILE_DIR}..."
+	if ! rm -rf "${COMPILE_DIR}"; then
+		msg_fatal "Could not fully remove ${COMPILE_DIR}.\nSomething in it is not removable by $(id -un). Remove it by hand, then re-run."
+	fi
+fi
+
+# The compile directory's parent may not exist if it was given as a
+# path several levels deep.
+mkdir -p "$(dirname "${COMPILE_DIR}")"
+
+if [ "${use_offline}" = true ]; then
+	# Existence and identity were both checked during pre-flight.
+	msg_info "Copying source from ${OFFLINE_CLONE}..."
+	if ! cp -a "${OFFLINE_CLONE}" "${COMPILE_DIR}"; then
+		msg_fatal "Failed to copy ${OFFLINE_CLONE} to ${COMPILE_DIR}."
+	fi
+	msg_ok "Source copied to ${COMPILE_DIR}."
+else
+	msg_info "Cloning llama.cpp source from github.com..."
+	if ! git clone https://github.com/ggml-org/llama.cpp "${COMPILE_DIR}" 2>&1; then
+		msg_fatal "git clone failed. Check network connectivity and try again."
+	fi
+	msg_ok "Source cloned to ${COMPILE_DIR}."
+fi
+
+# ─── Checkout requested version ──────────────────────────────────────
+# Default: checkout the latest build tag (bNNNN pattern).
+# -r latest: use git HEAD (no checkout).
+# -r <tag>: checkout that specific tag.
+if [ "${llamacpp_version}" = "latest" ]; then
+	msg_info "Using latest llama.cpp git HEAD as requested."
+elif [ -n "${llamacpp_version}" ]; then
+	msg_info "Checking out llama.cpp tag ${release_tag}..."
+	if ! checkout_output=$(git -C "${COMPILE_DIR}" -c advice.detachedHead=false checkout "${release_tag}" 2>&1); then
+		printf '%s\n' "${checkout_output}" >&2
+		msg_fatal "Failed to checkout tag '${release_tag}'."
+	fi
+	msg_ok "Checked out llama.cpp ${release_tag}."
+else
+	# No -r specified: find and checkout the latest build tag.
+	msg_info "Determining latest llama.cpp build tag..."
+	llamacpp_release_tag=$(git -C "${COMPILE_DIR}" tag -l 'b*' | grep -E '^b[0-9]+$' | sort -V | tail -1)
+	if [ -z "${llamacpp_release_tag}" ]; then
+		msg_warn "Could not determine a latest build tag. Continuing with HEAD."
+	else
+		msg_info "Checking out llama.cpp ${llamacpp_release_tag}..."
+		if ! checkout_output=$(git -C "${COMPILE_DIR}" -c advice.detachedHead=false checkout "${llamacpp_release_tag}" 2>&1); then
+			printf '%s\n' "${checkout_output}" >&2
+			msg_warn "Failed to checkout tag '${llamacpp_release_tag}'. Continuing with HEAD."
+		else
+			msg_ok "Checked out llama.cpp ${llamacpp_release_tag}."
+		fi
+	fi
+fi
+
+# ─── Resolve the build reference ─────────────────────────────────────
+# git describe gives one rule for every case. On an exact tag it
+# returns just that tag, so both a default build and an explicit
+# --release produce a clean name such as b11065 or v0.4.1. On a commit
+# past a tag it returns something like b11065-3-gce8caa6e6, which says
+# both which release the build is near and how far beyond it, which is
+# more useful for --release latest than a bare hash would be.
+#
+# Hyphens are kept rather than folded, since git describe relies on
+# them. Everything outside [A-Za-z0-9._-] becomes an underscore so
+# that a tag containing a slash or anything stranger cannot affect the
+# shape of the path.
+build_ref=$(git -C "${COMPILE_DIR}" describe --tags --always 2>/dev/null)
+if [ -z "${build_ref}" ]; then
+	build_ref="unknown"
+	msg_warn "Could not determine a git reference for this build, using 'unknown' in the directory name."
+fi
+build_ref=$(printf '%s' "${build_ref}" | tr -c 'A-Za-z0-9._-' '_')
+
+LLAMACPP_PREFIX="${LLAMACPP_LINK}-${backend}-${BUILD_TIMESTAMP}-${build_ref}"
+BUILD_CONF="${LLAMACPP_PREFIX}/llamacpp.conf"
+msg_info "Build reference: ${build_ref}"
+
+# ─── Create install prefix ──────────────────────────────────────────
+msg_info "Creating install prefix ${LLAMACPP_PREFIX}..."
+if ! sudo mkdir -p "${LLAMACPP_PREFIX}"; then
+	msg_fatal "Failed to create ${LLAMACPP_PREFIX}. Check permissions on /opt."
+fi
+
+# ─── Runtime library configuration (ld.so.conf.d) ───────────────────
+# Our entries are placed in a marked bloc at the TOP of the file for
+# highest priority. Any duplicate entries outside the bloc are removed.
+# The paths point at the /opt/llamacpp symlink rather than at a
+# versioned directory, so switching backends needs only a symlink
+# repoint plus ldconfig.
+managed_dirs=(
+	/opt/llamacpp/lib
+	/opt/llamacpp/lib64
+)
+
+msg_info "Updating ${LDCONF_FILE}..."
+
+managed_bloc="${BLOC_BEGIN}
+# Do not edit between these markers — managed by the local llama.cpp compile-script."
+for dir in "${managed_dirs[@]}"; do
+	managed_bloc="${managed_bloc}
+${dir}"
+done
+managed_bloc="${managed_bloc}
+${BLOC_END}"
+
+existing_content=""
+if [ -f "${LDCONF_FILE}" ]; then
+	existing_content=$(sudo cat "${LDCONF_FILE}")
+fi
+
+if [ -n "${existing_content}" ]; then
+	cleaned=$(echo "${existing_content}" | sed "/${BLOC_BEGIN//\//\\/}/,/${BLOC_END//\//\\/}/d")
+	for dir in "${managed_dirs[@]}"; do
+		cleaned=$(echo "${cleaned}" | grep -vxF "${dir}")
+	done
+	cleaned=$(echo "${cleaned}" | sed '/./,$!d' | sed -e :a -e '/^[[:space:]]*$/{ $d; N; ba; }')
+else
+	cleaned=""
+fi
+
+if [ -n "${cleaned}" ]; then
+	new_content="${managed_bloc}
+${cleaned}"
+else
+	new_content="${managed_bloc}"
+fi
+
+if echo "${new_content}" | sudo tee "${LDCONF_FILE}" >/dev/null; then
+	msg_ok "Written ${LDCONF_FILE}."
+else
+	msg_fatal "Failed to write ${LDCONF_FILE}."
+fi
+
+msg_info "Running ldconfig..."
+if ! sudo ldconfig; then
+	msg_fatal "ldconfig failed."
+fi
+msg_ok "ldconfig completed."
+
+# ─── Configure and compile ──────────────────────────────────────────
+# The GPU backends this script knows about are listed explicitly, ON
+# for the selected one and OFF for the rest, so that a toolkit left
+# installed on the machine for unrelated reasons cannot be pulled into
+# the build. Other backends upstream offers default to OFF already and
+# are left at upstream's defaults.
+#
+# CMAKE_INSTALL_RPATH embeds $ORIGIN-relative library directories in
+# every installed binary and library (as RUNPATH), so each build loads
+# its own libraries regardless of where /opt/llamacpp points or how it
+# was started. LD_LIBRARY_PATH can still override it, and the
+# ld.so.conf.d entry remains as a fallback. $ORIGIN must reach cmake
+# literally, hence the single quotes. Same mechanism as upstream's
+# docs/build.md "Overriding the CUDA Version" example.
+cd "${COMPILE_DIR}" || msg_fatal "Failed to enter ${COMPILE_DIR}."
+
+# shellcheck disable=SC2016  # $ORIGIN is for the dynamic linker, not bash
+cmake_args=(
+	-B build
+	-DCMAKE_BUILD_TYPE=Release
+	-DCMAKE_INSTALL_PREFIX="${LLAMACPP_PREFIX}"
+	'-DCMAKE_INSTALL_RPATH=$ORIGIN/../lib64;$ORIGIN/../lib'
+	-DGGML_CCACHE=OFF
+	-DGGML_NATIVE=ON
+	-DGGML_CUDA=OFF
+	-DGGML_VULKAN=OFF
+	-DGGML_HIP=OFF
+)
+
+case "${backend}" in
+	cuda)
+		cmake_args+=(
+			-DGGML_CUDA=ON
+			-DCMAKE_CUDA_ARCHITECTURES="${cuda_arch}"
+		)
+		;;
+	vulkan)
+		cmake_args+=(
+			-DGGML_VULKAN=ON
+		)
+		;;
+esac
+
+msg_info "Configuring llama.cpp for the $(backend_label "${backend}") backend..."
+run_logged "${COMPILE_DIR}/cmake_configure.log" \
+	"cmake configure failed." \
+	cmake "${cmake_args[@]}"
+msg_ok "cmake configure completed successfully."
+
+printf '%s' "${c_cyan}Compiling llama.cpp (using $(nproc) parallel jobs)${c_reset}"
+run_logged_dots "${COMPILE_DIR}/cmake_build.log" \
+	"Compilation failed." \
+	cmake --build build --config Release -j"$(nproc)"
+msg_ok "Compilation completed successfully."
+
+# ─── Install ─────────────────────────────────────────────────────────
+msg_info "Installing to ${LLAMACPP_PREFIX}..."
+run_logged "${COMPILE_DIR}/cmake_install.log" \
+	"Installation failed." \
+	sudo cmake --install build --config Release
+install_completed=true
+msg_ok "Installed to ${LLAMACPP_PREFIX}."
+
+# ─── Resolve the chosen GPU to a pinning value ───────────────────────
+# A CUDA choice already carries its UUID, which CUDA_VISIBLE_DEVICES
+# accepts as is. A Vulkan choice is a name, and GGML_VK_VISIBLE_DEVICES
+# takes the device's position in vkEnumeratePhysicalDevices(), which
+# includes llvmpipe and devices ggml does not support, so it differs
+# from ggml's own VulkanN numbering. Now that the binary exists it is
+# asked which raw position yields the chosen device, which is
+# authoritative because it is the same code that will run in the
+# service.
+#
+# No LD_LIBRARY_PATH is set: the binary must find its own libraries
+# through its embedded RUNPATH, exactly as it will under systemd, even
+# though /opt/llamacpp still points at the previous build here. Any
+# LD_LIBRARY_PATH inherited from the user's shell is removed too, since
+# the service never has one. A broken RUNPATH, or a library reachable
+# only through the user's shell, therefore fails here, before the
+# symlink moves, rather than later in the service.
+gpu_env_var=""
+gpu_value=""
+
+if [ -n "${selected_gpu_uuid}" ]; then
+	gpu_value="${selected_gpu_uuid}"
+	msg_info "Pinning by UUID: ${gpu_value}"
+elif [ -n "${selected_gpu_name}" ]; then
+	msg_info "Resolving '${selected_gpu_name}' to a device position..."
+	# The visible-device variables are stripped from the probe's
+	# environment. Without this, running the script from a shell that
+	# had sourced /etc/profile after a previous build would inherit
+	# that build's pinning, so the probe would see an already-filtered
+	# list, the chosen device would appear at a lower index than it
+	# actually has, and that wrong index would be written to the conf.
+	# The pre-build vulkaninfo pass is unaffected, because vulkaninfo
+	# is not a ggml program and ignores these variables entirely.
+	device_list=$(env \
+		-u GGML_VK_VISIBLE_DEVICES \
+		-u CUDA_VISIBLE_DEVICES \
+		-u ROCR_VISIBLE_DEVICES \
+		-u HIP_VISIBLE_DEVICES \
+		-u LD_LIBRARY_PATH \
+		"${LLAMACPP_PREFIX}/bin/llama-server" --list-devices 2>&1)
+
+	probe_device_count=0
+	name_found=false
+	while IFS= read -r line; do
+		# Lines look like:   Vulkan1: <name> (24560 MiB, 24533 MiB free)
+		case "${line}" in
+			*Vulkan[0-9]*:*) ;;
+			*) continue ;;
+		esac
+		probe_device_count=$((probe_device_count + 1))
+		name="${line#*: }"
+		# Strip the trailing " (NNNN MiB, NNNN MiB free)" only. The
+		# shortest-suffix form of ${var% } leaves any parentheses that
+		# are part of the device name itself intact.
+		name="${name% (*}"
+		if [ "${name}" = "${selected_gpu_name}" ]; then
+			name_found=true
+		fi
+	done <<< "${device_list}"
+
+	# Reported so that a filtered list is visible rather than silent.
+	# ggml lists only the devices it would use by default, so this can
+	# be smaller than the number of candidates vulkaninfo offered.
+	msg_info "Probe saw ${probe_device_count} device(s)."
+
+	# Find the raw position by restricting the binary to one position
+	# at a time and checking which device it then reports. vk_name is
+	# vulkaninfo's full list, CPU-type devices included, so its length
+	# covers every position. An out-of-range position makes ggml exit
+	# with an error, which simply produces no match.
+	if [ "${name_found}" = true ]; then
+		for ((raw = 0; raw < ${#vk_name[@]}; raw++)); do
+			probe=$(env \
+				-u CUDA_VISIBLE_DEVICES \
+				-u ROCR_VISIBLE_DEVICES \
+				-u HIP_VISIBLE_DEVICES \
+				-u LD_LIBRARY_PATH \
+				GGML_VK_VISIBLE_DEVICES="${raw}" \
+				"${LLAMACPP_PREFIX}/bin/llama-server" --list-devices 2>/dev/null \
+				| grep -m1 '^  Vulkan0: ')
+			probe="${probe#*: }"
+			if [ -n "${probe}" ] && [ "${probe% (*}" = "${selected_gpu_name}" ]; then
+				gpu_value="${raw}"
+				break
+			fi
+		done
+	fi
+
+	if [ -n "${gpu_value}" ]; then
+		msg_ok "Resolved to Vulkan device position ${gpu_value}."
+	else
+		printf '\n'
+		msg_warn "Could not resolve '${selected_gpu_name}' using the built binary. Its device list:"
+		printf '%s\n' "${device_list}"
+		printf '\n'
+		msg_warn "Leaving this build unrestricted, so llama-server will use every GPU it lists above, splitting models across them."
+		msg_info "Add GGML_VK_VISIBLE_DEVICES to ${PERSISTENT_CONF} to pin one by hand."
+	fi
+else
+	msg_info "CUDA build: leaving device selection unrestricted. Use --gpu to pin to one device."
+fi
+
+if [ -n "${gpu_value}" ]; then
+	case "${backend}" in
+		cuda)   gpu_env_var="CUDA_VISIBLE_DEVICES" ;;
+		vulkan) gpu_env_var="GGML_VK_VISIBLE_DEVICES" ;;
+	esac
+fi
+
+# ─── Write the per-build conf file ──────────────────────────────────
+# This lives inside the versioned prefix and is reached through the
+# /opt/llamacpp symlink, so switching backends switches the
+# environment along with the binaries.
+msg_info "Writing ${BUILD_CONF}..."
+
+build_conf_content="#
+# llamacpp.conf
+#
+# Generated by compllama for the ${backend} backend.
+# Belongs to ${LLAMACPP_PREFIX} and is REGENERATED on every build,
+# so this is not the place for settings you want to keep.
+#
+# For persistent, user-managed settings that survive rebuilds, use
+# ${PERSISTENT_CONF} instead. That file is created once as a
+# comments-only template if absent, and is never modified or removed
+# by this script afterwards. It is read after this one, so its values
+# take precedence.
+#
+# Format: systemd EnvironmentFile. Plain KEY=value lines only,
+# no \"export\" and no shell expansion.
+#"
+
+if [ -n "${gpu_env_var}" ]; then
+	build_conf_content="${build_conf_content}
+${gpu_env_var}=${gpu_value}"
+else
+	build_conf_content="${build_conf_content}
+# No device restriction was set for this build."
+fi
+
+if echo "${build_conf_content}" | sudo tee "${BUILD_CONF}" >/dev/null; then
+	msg_ok "Written ${BUILD_CONF}."
+else
+	msg_fatal "Failed to write ${BUILD_CONF}."
+fi
+
+# ─── Persistent conf template ───────────────────────────────────────
+# Created once, empty of settings, purely so that the file exists at a
+# known path and documents itself. Never written to again once present,
+# so anything put in it survives every later build.
+#
+# Emptying it rather than deleting it is the way to opt out after the
+# fact: a zero-byte file still exists, so it will not be recreated, and
+# it contributes nothing. Deleting it would bring the template back on
+# the next build.
+#
+# Failure here is not fatal. The build succeeded and the template is a
+# convenience, so an unwritable /etc is reported and stepped over.
+if [ "${create_conf_template}" = true ] && [ ! -f "${PERSISTENT_CONF}" ]; then
+	msg_info "Creating ${PERSISTENT_CONF} template..."
+	if sudo tee "${PERSISTENT_CONF}" >/dev/null <<PERSISTENT_CONF_EOF
+#
+# ${PERSISTENT_CONF}
+#
+# Persistent, user-managed environment for llama-server and for
+# interactive llama.cpp use. This file belongs to you: compllama
+# creates it once if it is absent and never touches it again.
+#
+# It is read after the active build's own /opt/llamacpp/llamacpp.conf,
+# by both the systemd unit and /etc/profile.d/llamacpp.sh, so anything
+# set here overrides the generated per-build values and survives every
+# rebuild and every backend switch.
+#
+# Format: systemd EnvironmentFile. Plain KEY=value lines only, no
+# "export" and no shell expansion. Lines not shaped like KEY=value are
+# ignored.
+#
+# Example, to override the GPU the build picked for itself:
+#   GGML_VK_VISIBLE_DEVICES=0
+#
+# An empty value does NOT lift a pin: GGML_VK_VISIBLE_DEVICES= selects
+# no Vulkan device at all, and CUDA_VISIBLE_DEVICES= hides every CUDA
+# device, so inference falls back to the CPU. To remove a pin, list the
+# devices you want instead.
+#
+# To opt out of this file without it being recreated, empty it rather
+# than deleting it:
+#   sudo truncate -s 0 ${PERSISTENT_CONF}
+# Deleting it would cause the next build to write this template again.
+# Passing --no-conf-template also suppresses creation.
+#
+PERSISTENT_CONF_EOF
+	then
+		msg_ok "Created ${PERSISTENT_CONF} (comments only, no settings active)."
+	else
+		conf_template_failed=true
+		msg_warn "Could not create ${PERSISTENT_CONF}."
+		msg_warn "The build is fine and llama-server will work, but there is no persistent settings file."
+		msg_info "This is expected if /etc is read-only. Use --no-conf-template to stop trying."
+	fi
+elif [ "${create_conf_template}" = false ]; then
+	msg_info "Skipping ${PERSISTENT_CONF} template as requested (--no-conf-template)."
+fi
+
+# ─── Symlink ─────────────────────────────────────────────────────────
+msg_info "Updating symlink ${LLAMACPP_LINK} -> ${LLAMACPP_PREFIX}..."
+if ! sudo ln -sfnT "${LLAMACPP_PREFIX}" "${LLAMACPP_LINK}"; then
+	msg_fatal "Failed to create symlink ${LLAMACPP_LINK}. Check permissions on /opt."
+fi
+msg_ok "Symlink updated."
+
+# ─── Final ldconfig ──────────────────────────────────────────────────
+msg_info "Running final ldconfig..."
+if ! sudo ldconfig; then
+	msg_fatal "ldconfig failed."
+fi
+msg_ok "ldconfig completed."
+
+# ─── Shell environment (profile.d) ──────────────────────────────────
+# Our bloc is placed at the END of the file so that our prepends to
+# each variable run last and therefore end up at the front.
+# Each addition is guarded to prevent duplicates on repeated sourcing.
+msg_info "Updating ${PROFILE_FILE}..."
+
+read -r -d '' profile_bloc <<'BLOC_CONTENT' || true
+# Do not edit between these markers — managed by the local llama.cpp compile-script.
+
+# Each prepend uses ${VAR:+:${VAR}} so that an empty or unset variable
+# gains no trailing empty element: in CPATH, LIBRARY_PATH and
+# PKG_CONFIG_PATH an empty element means the current directory, which
+# would silently put "." on the compiler's search paths.
+case ":${PATH}:" in
+	*":/opt/llamacpp/bin:"*) ;;
+	*) export PATH="/opt/llamacpp/bin${PATH:+:${PATH}}" ;;
+esac
+
+case ":${CPATH}:" in
+	*":/opt/llamacpp/include:"*) ;;
+	*) export CPATH="/opt/llamacpp/include${CPATH:+:${CPATH}}" ;;
+esac
+
+# MANPATH is the one exception, and deliberately so: for man-db a
+# trailing colon means "and the system's default man path too", so
+# without it every system man page would disappear.
+case ":${MANPATH}:" in
+	*":/opt/llamacpp/share/man:"*) ;;
+	*) export MANPATH="/opt/llamacpp/share/man:${MANPATH}" ;;
+esac
+
+# Libraries may be installed to lib or lib64 depending on the system,
+# so both are offered where they exist.
+for _llamacpp_dir in /opt/llamacpp/lib /opt/llamacpp/lib64; do
+	if [ -d "${_llamacpp_dir}" ]; then
+		case ":${LIBRARY_PATH}:" in
+			*":${_llamacpp_dir}:"*) ;;
+			*) export LIBRARY_PATH="${_llamacpp_dir}${LIBRARY_PATH:+:${LIBRARY_PATH}}" ;;
+		esac
+	fi
+	if [ -d "${_llamacpp_dir}/pkgconfig" ]; then
+		case ":${PKG_CONFIG_PATH}:" in
+			*":${_llamacpp_dir}/pkgconfig:"*) ;;
+			*) export PKG_CONFIG_PATH="${_llamacpp_dir}/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}" ;;
+		esac
+	fi
+done
+unset _llamacpp_dir
+
+# Export the active build's own environment, and then any persistent
+# user-managed settings, so that running llama-cli or llama-server by
+# hand behaves the same way the systemd unit does. The same two files
+# are read in the same order as the unit's EnvironmentFile lines, so
+# /etc/localllama.conf wins in both places.
+#
+# Only lines shaped like KEY=value are acted on, so comments, blank
+# lines and anything malformed are skipped rather than producing an
+# error on every login.
+for _llamacpp_conf in /opt/llamacpp/llamacpp.conf /etc/localllama.conf; do
+	[ -r "${_llamacpp_conf}" ] || continue
+	while IFS= read -r _llamacpp_line; do
+		case "${_llamacpp_line}" in
+			[A-Za-z_]*=*) export "${_llamacpp_line?}" 2>/dev/null ;;
+		esac
+	done < "${_llamacpp_conf}"
+done
+unset _llamacpp_conf _llamacpp_line
+BLOC_CONTENT
+
+managed_profile="${BLOC_BEGIN}
+${profile_bloc}
+${BLOC_END}"
+
+existing_profile=""
+if [ -f "${PROFILE_FILE}" ]; then
+	existing_profile=$(sudo cat "${PROFILE_FILE}")
+fi
+
+if [ -n "${existing_profile}" ]; then
+	cleaned_profile=$(echo "${existing_profile}" | sed "/${BLOC_BEGIN//\//\\/}/,/${BLOC_END//\//\\/}/d")
+	cleaned_profile=$(echo "${cleaned_profile}" | sed '/./,$!d' | sed -e :a -e '/^[[:space:]]*$/{ $d; N; ba; }')
+else
+	cleaned_profile=""
+fi
+
+if [ -n "${cleaned_profile}" ]; then
+	new_profile="${cleaned_profile}
+
+${managed_profile}"
+else
+	new_profile="#!/bin/bash
+
+#
+# /etc/profile.d/llamacpp.sh
+#
+# Shell environment for the locally compiled llama.cpp.
+#
+
+${managed_profile}"
+fi
+
+if echo "${new_profile}" | sudo tee "${PROFILE_FILE}" >/dev/null; then
+	msg_ok "Written ${PROFILE_FILE}."
+else
+	msg_fatal "Failed to write ${PROFILE_FILE}."
+fi
+
+if ! sudo chmod 0755 "${PROFILE_FILE}"; then
+	msg_fatal "Failed to set permissions on ${PROFILE_FILE}."
+fi
+msg_ok "Set ${PROFILE_FILE} executable."
+
+# ─── Install inillama (if requested) ────────────────────────────────
+# Installed before the service, and run once, so that the preset file
+# the service is started with exists and lists the models already on
+# disk. It is run as the invoking user, whose home holds the file; a
+# service running as another user needs inillama run as that user.
+if [ "${install_inillama}" = true ]; then
+	install_inillama run
+	if [ "${install_service}" = true ] && [ "${service_user}" != "${USER}" ]; then
+		msg_note "The service runs as ${service_user}, whose preset file is separate. Run inillama as ${service_user} too."
+	fi
+fi
+
+# ─── Install llama-server.service (if requested) ────────────────────
+# ExecStart is deliberately identical for every backend. Anything that
+# differs between backends goes in the generated conf file inside the
+# build prefix, which is why --activate needs only a symlink repoint.
+# Both EnvironmentFile lines carry a leading "-" so that neither file
+# needs to exist, and the user-managed one is read second so that it
+# overrides the generated one.
+if [ "${install_service}" = true ]; then
+	msg_info "Installing llama-server.service..."
+
+	# Resolve the home directory of the service user. Cannot use %h in
+	# the unit file as it may incorrectly resolve to root's home for
+	# system-level services.
+	service_home=$(getent passwd "${service_user}" | cut -d: -f6)
+	if [ -z "${service_home}" ]; then
+		msg_fatal "Could not determine home directory for user '${service_user}'."
+	fi
+
+	if ! sudo tee "${SERVICE_FILE}" >/dev/null <<SERVICEEOF
+${COMPLLAMA_MARK}
+[Unit]
+Description=llama.cpp llama-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${service_user}
+EnvironmentFile=-${LLAMACPP_LINK}/llamacpp.conf
+EnvironmentFile=-${PERSISTENT_CONF}
+ExecStart=${LLAMACPP_LINK}/bin/llama-server \\
+	--models-preset ${service_home}/${PRESET_FILE_REL} \\
+	--port ${service_port} \\
+	--host ${service_host} \\
+	--sleep-idle-seconds 1800 \\
+	--context-shift \\
+	--models-max 1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+	then
+		msg_fatal "Failed to write ${SERVICE_FILE}."
+	fi
+	msg_ok "Written ${SERVICE_FILE}."
+
+	msg_info "Reloading systemd and enabling llama-server.service..."
+	if ! sudo systemctl daemon-reload; then
+		msg_fatal "systemctl daemon-reload failed."
+	fi
+	if ! sudo systemctl enable llama-server.service; then
+		msg_fatal "Failed to enable llama-server.service."
+	fi
+	msg_ok "llama-server.service is enabled."
+	if ensure_service_presets; then
+		msg_info "Starting llama-server.service..."
+		if ! sudo systemctl restart llama-server.service; then
+			msg_fatal "Failed to start llama-server.service."
+		fi
+		confirm_service_running
+		msg_info "Follow logs with: journalctl -u llama-server.service -f"
+	fi
+fi
+
+# ─── Restart existing service (if not newly installed) ───────────────
+# Only a running service is restarted, so that one the user stopped on
+# purpose stays stopped. The running service keeps working until then,
+# since every build since 20261005T0300 loads its own libraries through
+# RUNPATH rather than through the /opt/llamacpp symlink.
+if [ "${install_service}" = false ] && [ -f "${SERVICE_FILE}" ]; then
+	if service_is_active && ensure_service_presets; then
+		msg_info "Restarting llama-server.service with the new build..."
+		sudo systemctl daemon-reload
+		if sudo systemctl restart llama-server.service; then
+			confirm_service_running
+		else
+			msg_warn "Failed to restart llama-server.service. Check with: journalctl -u llama-server.service -e"
+		fi
+	elif service_is_active; then
+		# ensure_service_presets has explained why; the running service
+		# keeps working on its current build until it is restarted.
+		:
+	else
+		msg_note "llama-server.service is not running, so it was left stopped."
+		msg_note "Start it with: sudo systemctl start llama-server.service"
+	fi
+
+fi
+
+# ─── Done ────────────────────────────────────────────────────────────
+printf '\n'
+msg_ok "llama.cpp ($(backend_label "${backend}")) built and installed successfully."
+msg_info "Installed:  ${LLAMACPP_PREFIX}"
+msg_info "Reference:  ${build_ref}"
+msg_info "Active via: ${LLAMACPP_LINK}"
+if [ -n "${gpu_env_var}" ]; then
+	msg_info "Pinned GPU: ${gpu_env_var}=${gpu_value}  (${selected_gpu_name})"
+fi
+if [ "${conf_template_failed}" = true ]; then
+	printf '\n'
+	msg_warn "NOTE: ${PERSISTENT_CONF} could not be created, so there is no persistent settings file."
+	msg_warn "Everything works, but settings you want to survive rebuilds have nowhere to live."
+	msg_warn "Create it yourself when /etc is writable, or pass --no-conf-template to stop trying."
+	printf '\n'
+fi
+msg_info "To activate in the current shell, run: source /etc/profile"
+msg_info "To switch backends later without recompiling: $(basename "$0") --activate <backend>"
